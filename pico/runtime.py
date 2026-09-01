@@ -93,8 +93,8 @@ class Pico:
         session=None,
         run_store=None,
         approval_policy="ask",
-        max_steps=6,
-        max_new_tokens=512,
+        max_steps=12,
+        max_new_tokens=1024,
         depth=0,
         max_depth=1,
         read_only=False,
@@ -425,11 +425,11 @@ class Pico:
                 seen_reads.add(path)
 
             if item["role"] == "tool":
-                limit = 900 if recent else 180
+                limit = 900 if recent else 500
                 lines.append(f"[tool:{item['name']}] {json.dumps(item['args'], sort_keys=True)}")
                 lines.append(clip(item["content"], limit))
             else:
-                limit = 900 if recent else 220
+                limit = 900 if recent else 600
                 lines.append(f"[{item['role']}] {clip(item['content'], limit)}")
 
         return clip("\n".join(lines), MAX_HISTORY)
@@ -1128,12 +1128,15 @@ class Pico:
 
     def repeated_tool_call(self, name, args):
         # agent 很常见的一种坏循环，是在没有新信息的情况下反复发起同一调用。
-        # 这里提前挡掉最简单的这种循环。
+        # 检查最近 window 次调用中，相同 (name, args) 是否已经出现了至少 2 次——
+        # 这样既能抓 A→B→A→B 交替循环，又不会误伤隔了很多步的回读。
         tool_events = [item for item in self.session["history"] if item["role"] == "tool"]
         if len(tool_events) < 2:
             return False
-        recent = tool_events[-2:]
-        return all(item["name"] == name and item["args"] == args for item in recent)
+        window = max(2, min(6, len(tool_events)))
+        recent = tool_events[-window:]
+        same_count = sum(1 for item in recent if item["name"] == name and item["args"] == args)
+        return same_count >= 2
 
     @staticmethod
     def new_task_id():

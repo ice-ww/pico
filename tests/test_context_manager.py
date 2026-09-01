@@ -93,7 +93,7 @@ def test_context_manager_renders_top_three_episodic_notes_per_note_under_budget(
     ).build("recall")
 
     assert metadata["relevant_memory"]["selected_count"] == 3
-    assert metadata["relevant_memory"]["limit"] == 3
+    assert metadata["relevant_memory"]["limit"] == 6
     assert metadata["relevant_memory"]["selected_notes"] == [
         "gamma episodic note " + ("C" * 120),
         "alpha episodic note " + ("A" * 120),

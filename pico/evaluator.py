@@ -110,6 +110,8 @@ def _git_value(args, fallback="", cwd=None):
             cwd=cwd or Path.cwd(),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=True,
             timeout=5,
         )
@@ -490,6 +492,8 @@ class BenchmarkEvaluator:
             shell=True,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
 
         within_budget = task_state.tool_steps <= int(task["step_budget"])

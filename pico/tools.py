@@ -18,7 +18,7 @@ BASE_TOOL_SPECS = {
         "description": "List files in the workspace.",
     },
     "read_file": {
-        "schema": {"path": "str", "start": "int=1", "end": "int=200"},
+        "schema": {"path": "str", "start": "int=1", "end": "int=400"},
         "risky": False,
         "description": "Read a UTF-8 file by line range.",
     },
@@ -45,7 +45,7 @@ BASE_TOOL_SPECS = {
 }
 
 DELEGATE_TOOL_SPEC = {
-    "schema": {"task": "str", "max_steps": "int=3"},
+    "schema": {"task": "str", "max_steps": "int=6"},
     "risky": False,
     "description": "Ask a bounded read-only child agent to investigate.",
 }
@@ -93,7 +93,7 @@ def validate_tool(agent, name, args):
         if not path.is_file():
             raise ValueError("path is not a file")
         start = int(args.get("start", 1))
-        end = int(args.get("end", 200))
+        end = int(args.get("end", 400))
         if start < 1 or end < start:
             raise ValueError("invalid line range")
         return
@@ -166,7 +166,7 @@ def tool_read_file(agent, args):
     if not path.is_file():
         raise ValueError("path is not a file")
     start = int(args.get("start", 1))
-    end = int(args.get("end", 200))
+    end = int(args.get("end", 400))
     if start < 1 or end < start:
         raise ValueError("invalid line range")
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -187,6 +187,8 @@ def tool_search(agent, args):
             cwd=agent.root,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         return result.stdout.strip() or result.stderr.strip() or "(no matches)"
 
@@ -217,6 +219,8 @@ def tool_run_shell(agent, args):
         shell=True,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=timeout,
         # 这里传入的是过滤后的环境变量，而不是直接继承整个父 shell 环境，
         # 目的是减少敏感信息被意外带进命令执行环境的风险。
@@ -273,7 +277,7 @@ def tool_delegate(agent, args):
         session_store=agent.session_store,
         run_store=agent.run_store,
         approval_policy="never",
-        max_steps=int(args.get("max_steps", 3)),
+        max_steps=int(args.get("max_steps", 6)),
         max_new_tokens=agent.max_new_tokens,
         depth=agent.depth + 1,
         max_depth=agent.max_depth,

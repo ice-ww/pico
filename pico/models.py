@@ -305,7 +305,14 @@ class OpenAICompatibleModelClient:
                 if exc.code >= 500 and attempt < attempts - 1:
                     time.sleep(0.5 * (attempt + 1))
                     continue
-                raise RuntimeError(f"OpenAI-compatible request failed with HTTP {exc.code}: {body}") from exc
+                request_url = self.base_url + "/responses"
+                masked_key = self.api_key[:8] + "..." if len(self.api_key) > 8 else "(empty)"
+                raise RuntimeError(
+                    f"OpenAI-compatible request failed with HTTP {exc.code}\n"
+                    f"URL: {request_url}\n"
+                    f"API key: {masked_key}\n"
+                    f"Response body: {body}"
+                ) from exc
             except (urllib.error.URLError, RemoteDisconnected) as exc:
                 if attempt < attempts - 1:
                     time.sleep(0.5 * (attempt + 1))
@@ -351,11 +358,36 @@ class OpenAICompatibleModelClient:
 
 
 def _extract_anthropic_text(data):
+    """从 Anthropic Messages API 响应中提取文本。
+
+    优先提取 text 块；如果模型返回了原生 tool_use 块（某些兼容后端会这样），
+    则将其转换为 Pico 的 XML 工具调用格式，让下游解析器能统一处理。
+    """
+    text_parts = []
+    tool_xml_parts = []
     for item in data.get("content", []):
-        if isinstance(item, dict) and item.get("type") == "text":
-            text = item.get("text")
-            if isinstance(text, str) and text:
-                return text
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("type", "")
+        if kind == "text":
+            t = item.get("text")
+            if isinstance(t, str) and t:
+                text_parts.append(t)
+        elif kind == "tool_use":
+            name = item.get("name", "")
+            inp = item.get("input", {})
+            if isinstance(name, str) and name:
+                try:
+                    # 转成 Pico 的 XML 格式，与 system prompt 中约定的工具调用格式一致
+                    tool_xml_parts.append(
+                        "<tool>" + json.dumps({"name": name, "args": inp}, ensure_ascii=False) + "</tool>"
+                    )
+                except Exception:
+                    pass
+    if text_parts:
+        return "\n".join(text_parts)
+    if tool_xml_parts:
+        return "\n".join(tool_xml_parts)
     return ""
 
 
@@ -416,7 +448,14 @@ class AnthropicCompatibleModelClient:
                 if exc.code >= 500 and attempt < attempts - 1:
                     time.sleep(0.5 * (attempt + 1))
                     continue
-                raise RuntimeError(f"Anthropic-compatible request failed with HTTP {exc.code}: {body}") from exc
+                request_url = self.base_url + "/messages"
+                masked_key = self.api_key[:8] + "..." if len(self.api_key) > 8 else "(empty)"
+                raise RuntimeError(
+                    f"Anthropic-compatible request failed with HTTP {exc.code}\n"
+                    f"URL: {request_url}\n"
+                    f"API key: {masked_key}\n"
+                    f"Response body: {body}"
+                ) from exc
             except (urllib.error.URLError, RemoteDisconnected) as exc:
                 if attempt < attempts - 1:
                     time.sleep(0.5 * (attempt + 1))
@@ -438,4 +477,13 @@ class AnthropicCompatibleModelClient:
         text = _extract_anthropic_text(data)
         if text:
             return text
-        raise RuntimeError("Anthropic-compatible error: could not extract text from response")
+        # 诊断：把 content 数组的结构摘要附在错误信息里，方便定位
+        content_types = []
+        for item in data.get("content", []):
+            if isinstance(item, dict):
+                content_types.append(item.get("type", "?"))
+            else:
+                content_types.append(type(item).__name__)
+        stop_reason = data.get("stop_reason", "")
+        detail = f"content_types={content_types}, stop_reason={stop_reason}"
+        raise RuntimeError(f"Anthropic-compatible error: could not extract text from response ({detail})")

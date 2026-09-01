@@ -1576,6 +1576,10 @@ def test_recent_transcript_entries_stay_richer_than_older_ones(tmp_path):
     agent.record({"role": "assistant", "content": recent_text, "created_at": "2026-04-07T09:05:00+00:00"})
     agent.record({"role": "user", "content": recent_text, "created_at": "2026-04-07T09:06:00+00:00"})
     agent.record({"role": "assistant", "content": recent_text, "created_at": "2026-04-07T09:07:00+00:00"})
+    agent.record({"role": "user", "content": recent_text, "created_at": "2026-04-07T09:08:00+00:00"})
+    agent.record({"role": "assistant", "content": recent_text, "created_at": "2026-04-07T09:09:00+00:00"})
+    agent.record({"role": "user", "content": recent_text, "created_at": "2026-04-07T09:10:00+00:00"})
+    agent.record({"role": "assistant", "content": recent_text, "created_at": "2026-04-07T09:11:00+00:00"})
 
     assert agent.ask("Check the transcript") == "Done."
 
