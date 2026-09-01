@@ -48,3 +48,5 @@ docs/
 
 # Packaging metadata
 pico.egg-info/
+
+.idea/
