@@ -15,6 +15,7 @@ from .workspace import clip, now
 WORKING_FILE_LIMIT = 8
 EPISODIC_NOTE_LIMIT = 12
 FILE_SUMMARY_LIMIT = 6
+LAST_SEEN_HASH_LIMIT = 16
 
 DURABLE_TOPIC_DEFAULTS = {
     "project-conventions": {
@@ -49,6 +50,7 @@ def default_memory_state():
         },
         "episodic_notes": [],
         "file_summaries": {},
+        "last_seen_hashes": {},
         "task": "",
         "files": [],
         "notes": [],
@@ -409,6 +411,21 @@ def normalize_memory_state(state, workspace_root=None):
         }
     state["file_summaries"] = normalized_file_summaries
 
+    # last_seen_hashes 记录“文件上次被读写时的版本 hash”，供编辑工具在执行前
+    # 做版本锚定：一旦文件在模型读写之后又变了，就能在执行前发现并拒绝。
+    last_seen_hashes = state.get("last_seen_hashes")
+    if not isinstance(last_seen_hashes, dict):
+        last_seen_hashes = {}
+    normalized_hashes = {}
+    for path, digest in last_seen_hashes.items():
+        path = canonicalize_path(path, workspace_root)
+        digest = str(digest).strip()
+        if not path or not digest:
+            continue
+        normalized_hashes[path] = digest
+    items = list(normalized_hashes.items())
+    state["last_seen_hashes"] = dict(items[-LAST_SEEN_HASH_LIMIT:])
+
     next_note_index = state.get("next_note_index")
     if not isinstance(next_note_index, int) or next_note_index < 0:
         next_note_index = 0
@@ -441,6 +458,28 @@ def remember_file(state, path, workspace_root=None):
     state["working"]["recent_files"] = files[-WORKING_FILE_LIMIT:]
     state["files"] = list(state["working"]["recent_files"])
     return state
+
+
+def remember_file_hash(state, path, workspace_root=None):
+    state = normalize_memory_state(state, workspace_root)
+    path = canonicalize_path(path, workspace_root).strip()
+    if not path:
+        return state
+    digest = file_freshness(path, workspace_root)
+    if digest is None:
+        return state
+    hashes = state["last_seen_hashes"]
+    hashes.pop(path, None)
+    hashes[path] = digest
+    while len(hashes) > LAST_SEEN_HASH_LIMIT:
+        hashes.pop(next(iter(hashes)))
+    return state
+
+
+def last_seen_hash(state, path, workspace_root=None):
+    state = normalize_memory_state(state, workspace_root)
+    path = canonicalize_path(path, workspace_root).strip()
+    return state["last_seen_hashes"].get(path)
 
 
 def append_note(state, text, tags=(), source="", created_at=None, workspace_root=None, kind="episodic"):
@@ -616,6 +655,13 @@ class LayeredMemory:
     def remember_file(self, path):
         self.state = remember_file(self.state, path, self.workspace_root)
         return self
+
+    def remember_file_hash(self, path):
+        self.state = remember_file_hash(self.state, path, self.workspace_root)
+        return self
+
+    def last_seen_hash(self, path):
+        return last_seen_hash(self.state, path, self.workspace_root)
 
     def append_note(self, text, tags=(), source="", created_at=None, kind="episodic"):
         self.state = append_note(

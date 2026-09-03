@@ -673,6 +673,10 @@ class Pico:
         # 读文件会生成摘要；写文件/patch 会让旧摘要失效，因为它们可能过期了。
         if name in {"read_file", "write_file", "patch_file"}:
             self.memory.remember_file(canonical_path)
+            # 记录“文件当前版本的 hash”，供 guard_edit 在执行编辑前做版本锚定：
+            # 一旦文件在模型读写之后又变了，就能在执行前发现并拒绝，而不是
+            # 基于旧快照静默改错位置。
+            self.memory.remember_file_hash(canonical_path)
         if name == "read_file":
             summary = memorylib.summarize_read_result(result)
             self.memory.set_file_summary(canonical_path, summary)
@@ -1004,6 +1008,75 @@ class Pico:
         self.run_store.write_report(task_state, self.redact_artifact(self.build_report(task_state)))
         return final
 
+    def guard_edit(self, name, args):
+        """编辑工具执行前的版本锚定 + 目标定位检查。
+
+        对应“可靠工具调用”的两个子问题：
+        - 文件版本过期：模型基于旧快照编辑，需要在执行前发现并拒绝；
+        - 目标上下文不存在 / 多处匹配：给出足够信息让模型一轮内重新锚定。
+
+        返回 (message, error_code) 表示应该拒绝本次编辑并回传该信息；
+        返回 None 表示可以继续执行。
+        """
+        if name not in ("patch_file", "write_file"):
+            return None
+        raw_path = str(args.get("path", "")).strip()
+        if not raw_path:
+            return None  # 交给 validate_tool 拒绝
+        try:
+            path = self.path(raw_path)
+        except ValueError:
+            return None  # path escape 由 validate_tool / 执行层报
+
+        # write_file 新建文件没有“版本过期”问题
+        if name == "write_file" and not path.exists():
+            return None
+        if not path.is_file():
+            return None  # validate_tool 会拒绝非文件
+
+        canonical = self.memory.canonical_path(raw_path)
+        current_hash = memorylib.file_freshness(canonical, self.root)
+
+        # 1) 版本锚定：文件在模型上次读写之后又变了
+        last_seen = self.memory.last_seen_hash(canonical)
+        if last_seen and current_hash and last_seen != current_hash:
+            return (
+                f"error: {canonical} changed since you last read or wrote it "
+                f"(last-seen {last_seen[:8]} != current {current_hash[:8]}); "
+                "re-read the file before editing.",
+                "stale_file_version",
+            )
+
+        # 2) 目标定位：patch_file 的 old_text 必须精确命中且唯一
+        if name != "patch_file":
+            return None
+        old_text = str(args.get("old_text", ""))
+        if not old_text:
+            return None  # validate_tool 拒绝空 old_text
+        text = path.read_text(encoding="utf-8", errors="replace")
+        matches = toolkit.locate_old_text(text, old_text)
+        if not matches:
+            head = "\n".join(
+                f"  {number:>4}: {line}"
+                for number, line in enumerate(text.splitlines()[:8], start=1)
+            )
+            return (
+                f"error: old_text not found in {canonical}; the file may have changed. "
+                f"Re-read it. Current head:\n{head}",
+                "patch_missing_context",
+            )
+        if len(matches) > 1:
+            listing = "\n".join(
+                f"  line {number}: {clip(context, 120)}"
+                for number, context in matches[:8]
+            )
+            return (
+                f"error: old_text occurs {len(matches)} times in {canonical}; "
+                "provide more surrounding context to disambiguate:\n" + listing,
+                "patch_ambiguous",
+            )
+        return None
+
     def run_tool(self, name, args):
         """执行一次工具调用，并在执行前后套上完整护栏。
 
@@ -1054,6 +1127,24 @@ class Pico:
                 "risk_level": "high" if tool["risky"] else "low",
                 "read_only": not tool["risky"],
                 "affected_paths": [],
+                "workspace_changed": False,
+                "diff_summary": [],
+            }
+            return message
+        edit_guard = self.guard_edit(name, args)
+        if edit_guard:
+            message, error_code = edit_guard
+            affected_paths = []
+            raw_path = str(args.get("path", "")).strip()
+            if raw_path:
+                affected_paths = [self.memory.canonical_path(raw_path)]
+            self._last_tool_result_metadata = {
+                "tool_status": "rejected",
+                "tool_error_code": error_code,
+                "security_event_type": "",
+                "risk_level": "high" if tool["risky"] else "low",
+                "read_only": not tool["risky"],
+                "affected_paths": affected_paths,
                 "workspace_changed": False,
                 "diff_summary": [],
             }

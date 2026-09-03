@@ -245,6 +245,69 @@ def test_patch_file_replaces_exact_match(tmp_path):
     assert file_path.read_text(encoding="utf-8") == "hello agent\n"
 
 
+def test_patch_after_read_does_not_trigger_stale(tmp_path):
+    file_path = tmp_path / "sample.txt"
+    file_path.write_text("hello world\n", encoding="utf-8")
+    agent = build_agent(tmp_path, [])
+
+    agent.run_tool("read_file", {"path": "sample.txt", "start": 1, "end": 1})
+
+    result = agent.run_tool(
+        "patch_file",
+        {"path": "sample.txt", "old_text": "world", "new_text": "agent"},
+    )
+
+    assert result == "patched sample.txt"
+    assert file_path.read_text(encoding="utf-8") == "hello agent\n"
+
+
+def test_patch_rejects_stale_file_version(tmp_path):
+    file_path = tmp_path / "sample.txt"
+    file_path.write_text("hello world\n", encoding="utf-8")
+    agent = build_agent(tmp_path, [])
+
+    agent.run_tool("read_file", {"path": "sample.txt", "start": 1, "end": 1})
+    # 模型读完之后，文件被外部改动
+    file_path.write_text("hello there\n", encoding="utf-8")
+
+    result = agent.run_tool(
+        "patch_file",
+        {"path": "sample.txt", "old_text": "world", "new_text": "agent"},
+    )
+
+    assert "changed since you last read or wrote it" in result
+    assert agent._last_tool_result_metadata["tool_error_code"] == "stale_file_version"
+    # 文件保持外部改动后的内容，没有被静默改错
+    assert file_path.read_text(encoding="utf-8") == "hello there\n"
+
+
+def test_patch_rejects_ambiguous_multiple_matches(tmp_path):
+    (tmp_path / "sample.txt").write_text("beta\ngamma\nbeta\n", encoding="utf-8")
+    agent = build_agent(tmp_path, [])
+
+    result = agent.run_tool(
+        "patch_file",
+        {"path": "sample.txt", "old_text": "beta", "new_text": "locked"},
+    )
+
+    assert "occurs 2 times" in result
+    assert "line 1" in result and "line 3" in result
+    assert agent._last_tool_result_metadata["tool_error_code"] == "patch_ambiguous"
+
+
+def test_patch_rejects_missing_context(tmp_path):
+    (tmp_path / "sample.txt").write_text("alpha\nbeta\n", encoding="utf-8")
+    agent = build_agent(tmp_path, [])
+
+    result = agent.run_tool(
+        "patch_file",
+        {"path": "sample.txt", "old_text": "does-not-exist", "new_text": "x"},
+    )
+
+    assert "old_text not found" in result
+    assert agent._last_tool_result_metadata["tool_error_code"] == "patch_missing_context"
+
+
 def test_invalid_risky_tool_does_not_prompt_for_approval(tmp_path):
     agent = build_agent(tmp_path, [], approval_policy="ask")
 

@@ -123,8 +123,9 @@ def validate_tool(agent, name, args):
         return
 
     if name == "patch_file":
-        # patch_file 故意做得很严格：old_text 必须精确命中且只能出现一次，
-        # 这样修改行为才是确定的，失败原因也更容易解释。
+        # 这里只校验参数形状；old_text 是否精确且唯一命中，交给 run_tool 的
+        # guard_edit 在执行前做版本锚定 + 目标定位检查——这样报错能带上行号与
+        # 上下文，帮助模型一轮内重新锚定，而不是对着一个含糊的报错干猜。
         path = agent.path(args["path"])
         if not path.is_file():
             raise ValueError("path is not a file")
@@ -133,10 +134,6 @@ def validate_tool(agent, name, args):
             raise ValueError("old_text must not be empty")
         if "new_text" not in args:
             raise ValueError("missing new_text")
-        text = path.read_text(encoding="utf-8")
-        count = text.count(old_text)
-        if count != 1:
-            raise ValueError(f"old_text must occur exactly once, found {count}")
         return
 
     if name == "delegate":
@@ -243,6 +240,31 @@ def tool_write_file(agent, args):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
     return f"wrote {path.relative_to(agent.root)} ({len(content)} chars)"
+
+
+def locate_old_text(text, old_text):
+    """定位 old_text 在 text 里的每一次出现，返回 (行号, 行内容) 列表。
+
+    用于 patch_file 的“多处匹配”与“目标不存在”诊断：给模型看每个匹配点的
+    行号和内容，让它能靠更多上下文消歧，而不是对着一个含糊的报错干猜。
+    """
+    if not old_text:
+        return []
+    matches = []
+    start = 0
+    while True:
+        index = text.find(old_text, start)
+        if index == -1:
+            break
+        line_number = text.count("\n", 0, index) + 1
+        line_start = text.rfind("\n", 0, index) + 1
+        line_end = text.find("\n", index)
+        if line_end == -1:
+            line_end = len(text)
+        line = text[line_start:line_end].strip()
+        matches.append((line_number, line))
+        start = index + len(old_text)
+    return matches
 
 
 def tool_patch_file(agent, args):
