@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 import pico as mini_pkg
 from pico import (
     AnthropicCompatibleModelClient,
@@ -878,6 +880,7 @@ def test_successful_run_persists_run_artifacts_and_stop_reason(tmp_path):
     assert "tool_executed" in trace_events
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="依赖 POSIX printf 且 clear=True 会清掉 ComSpec/SystemRoot，Windows shell 无法启动")
 def test_trace_and_report_redact_secret_env_values(tmp_path):
     secret = "sk-test-secret-123"
     with patch.dict(os.environ, {"OPENAI_API_KEY": secret}, clear=True):

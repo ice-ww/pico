@@ -1,7 +1,10 @@
 import os
 import shlex
+import subprocess
 import sys
 from unittest.mock import patch
+
+import pytest
 
 from pico import FakeModelClient, MiniAgent, SessionStore, WorkspaceContext
 from pico import cli as mini_cli
@@ -35,6 +38,7 @@ def test_workspace_escape_is_rejected(tmp_path):
     assert "path escapes workspace" in result
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows 创建符号链接需要管理员/开发者模式权限")
 def test_symlink_path_traversal_is_rejected(tmp_path):
     outside = tmp_path.parent / f"{tmp_path.name}-outside.txt"
     outside.write_text("outside\n", encoding="utf-8")
@@ -147,7 +151,11 @@ def test_run_shell_uses_allowlisted_environment_only(tmp_path):
     secret = "shh-allowlist-secret"
     agent = build_agent(tmp_path, [], approval_policy="auto")
     script = 'import os; print(os.getenv("MCA_ALLOWLIST_SECRET", "missing"))'
-    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+    if os.name == "nt":
+        # Windows 的 cmd.exe 不认 POSIX 单引号；用 list2cmdline 生成 cmd 规则引号。
+        command = subprocess.list2cmdline([sys.executable, "-c", script])
+    else:
+        command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
 
     with patch.dict(os.environ, {"MCA_ALLOWLIST_SECRET": secret}, clear=False):
         result = agent.run_tool("run_shell", {"command": command, "timeout": 20})

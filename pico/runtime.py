@@ -25,6 +25,9 @@ from .workspace import IGNORED_PATH_NAMES, MAX_HISTORY, WorkspaceContext, clip, 
 SENSITIVE_ENV_NAME_MARKERS = ("API_KEY", "TOKEN", "SECRET", "PASSWORD")
 REDACTED_VALUE = "<redacted>"
 DEFAULT_SHELL_ENV_ALLOWLIST = ("HOME", "LANG", "LC_ALL", "LC_CTYPE", "LOGNAME", "PATH", "PWD", "SHELL", "TERM", "TMPDIR", "TMP", "TEMP", "USER")
+# Windows 下 `subprocess.run(shell=True)` 依赖这些变量才能定位 cmd.exe 并正常执行；
+# allowlist 本身是跨平台的、不含它们，所以 Windows 需要额外透传。
+WINDOWS_SHELL_ENV_NAMES = ("COMSPEC", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "PATHEXT")
 DEFAULT_FEATURE_FLAGS = {
     "memory": True,
     "relevant_memory": True,
@@ -518,6 +521,10 @@ class Pico:
         env["PWD"] = str(self.root)
         if "PATH" not in env and os.environ.get("PATH"):
             env["PATH"] = os.environ["PATH"]
+        if os.name == "nt":
+            for name in WINDOWS_SHELL_ENV_NAMES:
+                if name in os.environ:
+                    env[name] = os.environ[name]
         return env
 
     def prompt_metadata(self, user_message, prompt):

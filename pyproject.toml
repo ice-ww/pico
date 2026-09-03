@@ -7,7 +7,9 @@ name = "pico"
 version = "0.1.0"
 description = "Small local coding agent for Ollama, OpenAI-compatible, Anthropic-compatible, and DeepSeek models"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+  "tzdata>=2024.1",
+]
 
 [project.scripts]
 pico = "pico.cli:main"

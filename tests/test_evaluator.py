@@ -1,4 +1,5 @@
 import json
+import sys
 from pathlib import Path
 from collections import Counter
 
@@ -115,7 +116,11 @@ def test_run_fixed_benchmark_reports_metadata_and_success_definition(tmp_path):
         "max_new_tokens": 64,
     }
     assert reproducibility["timezone"] == "Asia/Shanghai"
-    assert reproducibility["locale"] == "C.UTF-8"
+    # locale 是环境相关的可复现元数据；Windows 上是系统 locale（如
+    # "Chinese (Simplified)_China.936"），POSIX CI 上才是 "C.UTF-8"。
+    assert reproducibility["locale"]
+    if sys.platform != "win32":
+        assert reproducibility["locale"] == "C.UTF-8"
 
     for row in artifact["rows"]:
         assert not row["fixture_copy_relpath"].startswith("/")

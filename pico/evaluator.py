@@ -3,8 +3,9 @@ import json
 import locale as locale_module
 import shutil
 import subprocess
+import sys
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -128,7 +129,28 @@ def _current_locale():
 
 
 def _now_in_timezone(timezone_name):
-    return datetime.now(ZoneInfo(timezone_name)).strftime("%Y-%m-%dT%H:%M:%S%z")
+    try:
+        return datetime.now(ZoneInfo(timezone_name)).strftime("%Y-%m-%dT%H:%M:%S%z")
+    except Exception:
+        # 某些系统（尤其是没装 tzdata 的 Windows）拿不到 IANA 时区表；
+        # 退化为 UTC，避免一次时区缺失就把整份 benchmark 结果丢掉。
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def _resolve_verifier_command(verifier):
+    """把 verifier 命令开头的 `python3`/`python` 换成当前解释器。
+
+    benchmark 里的 verifier 写死了 `python3`，但 Windows 上 `python3` 常常是
+    微软商店的占位符而非真实解释器，导致 verifier 全部失败。统一替换成正在
+    运行本程序的解释器，保证同一份 JSON 在 Windows / Linux 上都能跑。
+    """
+    tokens = verifier.split(None, 1)
+    if tokens and tokens[0] in ("python3", "python"):
+        interpreter = sys.executable
+        if " " in interpreter:
+            interpreter = f'"{interpreter}"'
+        return interpreter + (f" {tokens[1]}" if len(tokens) > 1 else "")
+    return verifier
 
 
 def _artifact_path_for_task(task):
@@ -487,7 +509,7 @@ class BenchmarkEvaluator:
         artifact_digest = _digest_file(artifact_file) if expected_artifact_exists else ""
 
         verifier = subprocess.run(
-            task["verifier"],
+            _resolve_verifier_command(task["verifier"]),
             cwd=fixture_copy_root,
             shell=True,
             capture_output=True,
