@@ -154,13 +154,13 @@ def test_context_manager_collapses_older_duplicate_reads_into_one_summary_line(t
             }
         )
 
-    for minute in range(2, 8):
+    for minute in range(2, 12):
         role = "user" if minute % 2 == 0 else "assistant"
         agent.record(
             {
                 "role": role,
                 "content": f"recent-{minute}",
-                "created_at": f"2026-04-07T09:0{minute}:00+00:00",
+                "created_at": f"2026-04-07T09:{minute:02d}:00+00:00",
             }
         )
 
@@ -186,13 +186,13 @@ def test_context_manager_summarizes_older_tool_output_into_one_line(tmp_path):
         }
     )
 
-    for minute in range(1, 7):
+    for minute in range(1, 12):
         role = "user" if minute % 2 == 1 else "assistant"
         agent.record(
             {
                 "role": role,
                 "content": f"recent-{minute}",
-                "created_at": f"2026-04-07T09:0{minute}:00+00:00",
+                "created_at": f"2026-04-07T09:{minute:02d}:00+00:00",
             }
         )
 
