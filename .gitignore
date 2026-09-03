@@ -41,7 +41,10 @@ readme_intro_locked/
 !.env.example
 
 # Local docs not intended for publication
-docs/
+docs/*
+# 但评审交付物（review pack / architecture 概览）是要提交到仓库的
+!docs/review-pack/
+!docs/architecture/
 
 # OS files
 .DS_Store
