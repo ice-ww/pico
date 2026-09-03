@@ -37,6 +37,7 @@ class TaskState:
     final_answer: str = ""
     checkpoint_id: str = ""
     resume_status: str = ""
+    replan_count: int = 0
 
     @classmethod
     def create(cls, task_id, user_request, run_id=""):
@@ -58,6 +59,7 @@ class TaskState:
             final_answer=str(data.get("final_answer", "")),
             checkpoint_id=str(data.get("checkpoint_id", "")),
             resume_status=str(data.get("resume_status", "")),
+            replan_count=int(data.get("replan_count", 0)),
         )
 
     def record_attempt(self):
@@ -107,4 +109,5 @@ class TaskState:
             "final_answer": self.final_answer,
             "checkpoint_id": self.checkpoint_id,
             "resume_status": self.resume_status,
+            "replan_count": self.replan_count,
         }

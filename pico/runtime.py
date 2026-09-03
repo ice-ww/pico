@@ -33,7 +33,19 @@ DEFAULT_FEATURE_FLAGS = {
     "relevant_memory": True,
     "context_reduction": True,
     "prompt_cache": True,
+    "replan": True,
 }
+# 低进度检测：连续这么多次工具执行都没有「推进」（既没改 workspace，也没成功），
+# 就触发一次本地重新规划，而不是一路烧到 step_limit 才停。
+LOW_PROGRESS_THRESHOLD = 3
+# 单次运行最多注入几次重新规划提示，防止「反思」本身变成新的死循环。
+MAX_REPLANS = 2
+REPLAN_PROMPT = (
+    "You appear to be making little progress. Stop and reassess: "
+    "what is the current goal, what have you already tried, what is blocking you, "
+    "and what is a different concrete next step? Avoid repeating actions that just failed. "
+    "Then continue."
+)
 CHECKPOINT_SCHEMA_VERSION = "phase1-v1"
 CHECKPOINT_NONE_STATUS = "no-checkpoint"
 CHECKPOINT_FULL_VALID_STATUS = "full-valid"
@@ -152,6 +164,8 @@ class Pico:
             "workspace_changed": False,
             "prefix_changed": False,
         }
+        # 低进度检测的运行时计数：连续无推进步数、已注入的重新规划次数、事件日志。
+        self._progress = {"consecutive_no_progress": 0, "replan_count": 0, "low_progress_events": []}
 
     @classmethod
     def from_session(cls, model_client, workspace, session_store, session_id, **kwargs):
@@ -933,6 +947,27 @@ class Pico:
                         **dict(self._last_tool_result_metadata or {}),
                     },
                 )
+                low_progress_reason = self.detect_low_progress()
+                if low_progress_reason and self._progress["replan_count"] < MAX_REPLANS:
+                    self._progress["low_progress_events"].append(
+                        {"tool_steps": tool_steps, "reason": low_progress_reason}
+                    )
+                    self.emit_trace(
+                        task_state,
+                        "low_progress_detected",
+                        {
+                            "reason": low_progress_reason,
+                            "tool_steps": tool_steps,
+                            "replan_count": self._progress["replan_count"],
+                        },
+                    )
+                    self._inject_replan_prompt(task_state)
+                    self.emit_trace(
+                        task_state,
+                        "replan_injected",
+                        {"replan_count": self._progress["replan_count"]},
+                    )
+                    self.run_store.write_task_state(task_state)
                 checkpoint = self.create_checkpoint(task_state, user_message, trigger="tool_executed")
                 self.run_store.write_task_state(task_state)
                 self.emit_trace(
@@ -1224,6 +1259,43 @@ class Pico:
             self.record_process_note_for_tool(name, self._last_tool_result_metadata)
             return f"error: tool {name} failed: {exc}"
 
+    def _step_made_progress(self, metadata):
+        """判断最近一步工具执行是否有推进。
+
+        有推进 = 改了 workspace（写/删/改文件），或工具本身成功（tool_status == "ok"）。
+        读取类工具属于成功、不改文件，算有推进，避免误伤正常的探索阶段；
+        只有失败/拒绝/部分成功且没改文件，才算「无推进」。
+        """
+        if metadata.get("workspace_changed"):
+            return True
+        return str(metadata.get("tool_status", "")) == "ok"
+
+    def detect_low_progress(self):
+        """连续 LOW_PROGRESS_THRESHOLD 步无推进时返回触发原因，否则返回 None。
+
+        每步工具执行完，用最新的 `_last_tool_result_metadata` 更新连续无推进计数。
+        """
+        if not self.feature_enabled("replan"):
+            return None
+        metadata = self._last_tool_result_metadata or {}
+        if self._step_made_progress(metadata):
+            self._progress["consecutive_no_progress"] = 0
+            return None
+        self._progress["consecutive_no_progress"] += 1
+        if self._progress["consecutive_no_progress"] < LOW_PROGRESS_THRESHOLD:
+            return None
+        return (
+            f"{self._progress['consecutive_no_progress']} consecutive tool steps without progress "
+            f"(last tool_status={metadata.get('tool_status', '')})"
+        )
+
+    def _inject_replan_prompt(self, task_state):
+        """把一段反思提示写进会话历史，下一轮 prompt 自然带出；并重置无进度计数。"""
+        self.record({"role": "user", "content": REPLAN_PROMPT, "created_at": now()})
+        self._progress["replan_count"] += 1
+        self._progress["consecutive_no_progress"] = 0
+        task_state.replan_count = self._progress["replan_count"]
+
     def repeated_tool_call(self, name, args):
         # agent 很常见的一种坏循环，是在没有新信息的情况下反复发起同一调用。
         # 检查最近 window 次调用中，相同 (name, args) 是否已经出现了至少 2 次——
@@ -1257,6 +1329,8 @@ class Pico:
             "attempts": task_state.attempts,
             "checkpoint_id": task_state.checkpoint_id,
             "resume_status": task_state.resume_status,
+            "replan_count": task_state.replan_count,
+            "low_progress_events": list(self._progress["low_progress_events"]),
             "task_state": task_state.to_dict(),
             "prompt_metadata": self.last_prompt_metadata,
             "durable_promotions": list(self.last_durable_promotions),
