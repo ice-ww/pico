@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -245,6 +246,42 @@ def test_patch_file_replaces_exact_match(tmp_path):
     assert file_path.read_text(encoding="utf-8") == "hello agent\n"
 
 
+def test_patch_treats_null_optional_anchor_fields_as_omitted(tmp_path):
+    file_path = tmp_path / "sample.txt"
+    file_path.write_text("hello world\n", encoding="utf-8")
+    agent = build_agent(tmp_path, [])
+
+    result = agent.run_tool(
+        "patch_file",
+        {
+            "path": "sample.txt",
+            "old_text": "world",
+            "new_text": "agent",
+            "snapshot_id": None,
+            "target_line": None,
+        },
+    )
+
+    assert result == "patched sample.txt"
+    assert file_path.read_text(encoding="utf-8") == "hello agent\n"
+
+
+def test_xml_patch_parser_accepts_snapshot_child_tags(tmp_path):
+    agent = build_agent(tmp_path, [])
+
+    parsed = agent.parse_xml_tool(
+        '<tool name="patch_file" path="sample.py">'
+        '<old_text>return value</old_text>'
+        '<new_text>return normalized</new_text>'
+        '<snapshot_id>read_aaaaaaaaaaaa</snapshot_id>'
+        '<target_line>12</target_line>'
+        '</tool>'
+    )
+
+    assert parsed["args"]["snapshot_id"] == "read_aaaaaaaaaaaa"
+    assert parsed["args"]["target_line"] == "12"
+
+
 def test_patch_after_read_does_not_trigger_stale(tmp_path):
     file_path = tmp_path / "sample.txt"
     file_path.write_text("hello world\n", encoding="utf-8")
@@ -261,7 +298,384 @@ def test_patch_after_read_does_not_trigger_stale(tmp_path):
     assert file_path.read_text(encoding="utf-8") == "hello agent\n"
 
 
-def test_patch_rejects_stale_file_version(tmp_path):
+def test_patch_reanchors_after_unrelated_external_change(tmp_path):
+    file_path = tmp_path / "sample.txt"
+    file_path.write_text("hello world\n", encoding="utf-8")
+    agent = build_agent(tmp_path, [])
+
+    agent.run_tool("read_file", {"path": "sample.txt", "start": 1, "end": 1})
+    file_path.write_text("# external note\nhello world\n", encoding="utf-8")
+
+    result = agent.run_tool(
+        "patch_file",
+        {"path": "sample.txt", "old_text": "world", "new_text": "agent"},
+    )
+
+    assert result == "patched sample.txt"
+    assert file_path.read_text(encoding="utf-8") == "# external note\nhello agent\n"
+
+
+def test_snapshot_anchor_selects_repeated_old_text(tmp_path):
+    file_path = tmp_path / "sample.py"
+    file_path.write_text(
+        "def first():\n"
+        "    marker = 'first'\n"
+        "    return value\n"
+        "\n"
+        "def second():\n"
+        "    marker = 'second'\n"
+        "    return value\n",
+        encoding="utf-8",
+    )
+    agent = build_agent(tmp_path, [])
+
+    read_result = agent.run_tool("read_file", {"path": "sample.py", "start": 1, "end": 7})
+    snapshot_id = re.search(r"snapshot_id: ([a-z0-9_]+)", read_result).group(1)
+
+    result = agent.run_tool(
+        "patch_file",
+        {
+            "path": "sample.py",
+            "old_text": "return value",
+            "new_text": "return normalized",
+            "snapshot_id": snapshot_id,
+            "target_line": 7,
+        },
+    )
+
+    assert result == "patched sample.py"
+    assert file_path.read_text(encoding="utf-8").count("return value") == 1
+    assert "marker = 'second'\n    return normalized" in file_path.read_text(encoding="utf-8")
+
+
+def test_snapshot_anchor_relocates_repeated_target_after_line_shift(tmp_path):
+    file_path = tmp_path / "sample.py"
+    original = (
+        "def first():\n"
+        "    marker = 'first'\n"
+        "    return value\n"
+        "\n"
+        "def second():\n"
+        "    marker = 'second'\n"
+        "    return value\n"
+    )
+    file_path.write_text(original, encoding="utf-8")
+    agent = build_agent(tmp_path, [])
+
+    read_result = agent.run_tool("read_file", {"path": "sample.py", "start": 1, "end": 7})
+    snapshot_id = re.search(r"snapshot_id: ([a-z0-9_]+)", read_result).group(1)
+    file_path.write_text("# external note\n" + original, encoding="utf-8")
+
+    result = agent.run_tool(
+        "patch_file",
+        {
+            "path": "sample.py",
+            "old_text": "return value",
+            "new_text": "return normalized",
+            "snapshot_id": snapshot_id,
+            "target_line": 7,
+        },
+    )
+
+    assert result == "patched sample.py"
+    updated = file_path.read_text(encoding="utf-8")
+    assert "marker = 'first'\n    return value" in updated
+    assert "marker = 'second'\n    return normalized" in updated
+
+
+def test_snapshot_anchor_uses_local_context_when_other_read_lines_changed(tmp_path):
+    file_path = tmp_path / "sample.py"
+    original = (
+        "module note\n"
+        "unchanged preface\n"
+        "\n"
+        "def first():\n"
+        "    marker = 'first'\n"
+        "    return value\n"
+        "\n"
+        "def second():\n"
+        "    marker = 'second'\n"
+        "    return value\n"
+    )
+    file_path.write_text(original, encoding="utf-8")
+    agent = build_agent(tmp_path, [])
+
+    read_result = agent.run_tool("read_file", {"path": "sample.py", "start": 1, "end": 10})
+    snapshot_id = re.search(r"snapshot_id: ([a-z0-9_]+)", read_result).group(1)
+    file_path.write_text(original.replace("module note", "externally revised note"), encoding="utf-8")
+
+    result = agent.run_tool(
+        "patch_file",
+        {
+            "path": "sample.py",
+            "old_text": "return value",
+            "new_text": "return normalized",
+            "snapshot_id": snapshot_id,
+            "target_line": 10,
+        },
+    )
+
+    assert result == "patched sample.py"
+    updated = file_path.read_text(encoding="utf-8")
+    assert "marker = 'first'\n    return value" in updated
+    assert "marker = 'second'\n    return normalized" in updated
+
+
+def test_snapshot_anchor_rejects_unverifiable_repeated_target_after_change(tmp_path):
+    file_path = tmp_path / "sample.txt"
+    original = "label\nreturn value\n\nlabel\nreturn value\n"
+    file_path.write_text(original, encoding="utf-8")
+    agent = build_agent(tmp_path, [])
+
+    read_result = agent.run_tool("read_file", {"path": "sample.txt", "start": 1, "end": 2})
+    snapshot_id = re.search(r"snapshot_id: ([a-z0-9_]+)", read_result).group(1)
+    file_path.write_text("# external note\n" + original, encoding="utf-8")
+
+    result = agent.run_tool(
+        "patch_file",
+        {
+            "path": "sample.txt",
+            "old_text": "return value",
+            "new_text": "return normalized",
+            "snapshot_id": snapshot_id,
+            "target_line": 2,
+        },
+    )
+
+    assert "cannot uniquely re-anchor" in result
+    assert agent._last_tool_result_metadata["tool_error_code"] == "patch_ambiguous"
+    assert file_path.read_text(encoding="utf-8") == "# external note\n" + original
+
+
+def test_snapshot_anchor_rejects_snapshot_from_another_file(tmp_path):
+    (tmp_path / "first.txt").write_text("target\n", encoding="utf-8")
+    second = tmp_path / "second.txt"
+    second.write_text("target\n", encoding="utf-8")
+    agent = build_agent(tmp_path, [])
+
+    read_result = agent.run_tool("read_file", {"path": "first.txt", "start": 1, "end": 1})
+    snapshot_id = re.search(r"snapshot_id: ([a-z0-9_]+)", read_result).group(1)
+
+    result = agent.run_tool(
+        "patch_file",
+        {
+            "path": "second.txt",
+            "old_text": "target",
+            "new_text": "changed",
+            "snapshot_id": snapshot_id,
+            "target_line": 1,
+        },
+    )
+
+    assert "belongs to a different file" in result
+    assert agent._last_tool_result_metadata["tool_error_code"] == "patch_snapshot_mismatch"
+    assert second.read_text(encoding="utf-8") == "target\n"
+
+
+def test_reset_discards_read_snapshots(tmp_path):
+    file_path = tmp_path / "sample.txt"
+    file_path.write_text("target\n", encoding="utf-8")
+    agent = build_agent(tmp_path, [])
+
+    read_result = agent.run_tool("read_file", {"path": "sample.txt", "start": 1, "end": 1})
+    snapshot_id = re.search(r"snapshot_id: ([a-z0-9_]+)", read_result).group(1)
+
+    agent.reset()
+
+    assert agent.session["read_snapshots"] == {}
+    result = agent.run_tool(
+        "patch_file",
+        {
+            "path": "sample.txt",
+            "old_text": "target",
+            "new_text": "changed",
+            "snapshot_id": snapshot_id,
+            "target_line": 1,
+        },
+    )
+    assert "is unavailable" in result
+    assert file_path.read_text(encoding="utf-8") == "target\n"
+
+
+def test_resume_sanitizes_persisted_read_snapshots(tmp_path):
+    agent = build_agent(tmp_path, [])
+    agent.session["read_snapshots"] = {
+        "read_aaaaaaaaaaaa": {
+            "path": "sample.txt",
+            "start": 1,
+            "end": 1,
+            "content": "target\n",
+            "file_hash": "a" * 64,
+            "unexpected": "x" * 100_000,
+        },
+        "read_badbadbadbad": {
+            "path": ["not", "a", "path"],
+            "start": "not-an-int",
+            "end": 1,
+            "content": "target\n",
+            "file_hash": "not-a-hash",
+        },
+    }
+    agent.session_store.save(agent.session)
+
+    resumed = MiniAgent.from_session(
+        model_client=FakeModelClient([]),
+        workspace=build_workspace(tmp_path),
+        session_store=agent.session_store,
+        session_id=agent.session["id"],
+        approval_policy="auto",
+    )
+
+    assert resumed.session["read_snapshots"] == {
+        "read_aaaaaaaaaaaa": {
+            "path": "sample.txt",
+            "start": 1,
+            "end": 1,
+            "content": "target\n",
+            "file_hash": "a" * 64,
+        }
+    }
+
+
+def test_write_file_keeps_strict_whole_file_version_guard(tmp_path):
+    file_path = tmp_path / "sample.txt"
+    file_path.write_text("original\n", encoding="utf-8")
+    agent = build_agent(tmp_path, [])
+
+    agent.run_tool("read_file", {"path": "sample.txt", "start": 1, "end": 1})
+    file_path.write_text("external\n", encoding="utf-8")
+
+    result = agent.run_tool("write_file", {"path": "sample.txt", "content": "replacement\n"})
+
+    assert "changed since you last read or wrote it" in result
+    assert agent._last_tool_result_metadata["tool_error_code"] == "stale_file_version"
+    assert file_path.read_text(encoding="utf-8") == "external\n"
+
+
+def test_write_file_rechecks_existing_file_after_approval(tmp_path):
+    file_path = tmp_path / "sample.txt"
+    file_path.write_text("original\n", encoding="utf-8")
+    agent = build_agent(tmp_path, [], approval_policy="ask")
+    agent.run_tool("read_file", {"path": "sample.txt", "start": 1, "end": 1})
+
+    def external_edit_during_approval(name, args):
+        file_path.write_text("external\n", encoding="utf-8")
+        return True
+
+    with patch.object(agent, "approve", side_effect=external_edit_during_approval):
+        result = agent.run_tool("write_file", {"path": "sample.txt", "content": "replacement\n"})
+
+    assert "changed again while preparing the write" in result
+    assert file_path.read_text(encoding="utf-8") == "external\n"
+
+
+def test_read_records_the_exact_version_returned_to_the_model(tmp_path):
+    file_path = tmp_path / "sample.txt"
+    file_path.write_text("observed\n", encoding="utf-8")
+    agent = build_agent(tmp_path, [])
+    original_update = agent.update_memory_after_tool
+
+    def external_edit_before_memory_update(name, args, result):
+        file_path.write_text("external\n", encoding="utf-8")
+        return original_update(name, args, result)
+
+    with patch.object(agent, "update_memory_after_tool", side_effect=external_edit_before_memory_update):
+        agent.run_tool("read_file", {"path": "sample.txt", "start": 1, "end": 1})
+
+    result = agent.run_tool("write_file", {"path": "sample.txt", "content": "replacement\n"})
+
+    assert "changed since you last read or wrote it" in result
+    assert file_path.read_text(encoding="utf-8") == "external\n"
+
+
+def test_version_guard_stays_active_when_semantic_memory_is_disabled(tmp_path):
+    file_path = tmp_path / "sample.txt"
+    file_path.write_text("observed\n", encoding="utf-8")
+    agent = build_agent(tmp_path, [], feature_flags={"memory": False})
+
+    agent.run_tool("read_file", {"path": "sample.txt", "start": 1, "end": 1})
+    file_path.write_text("external\n", encoding="utf-8")
+
+    result = agent.run_tool("write_file", {"path": "sample.txt", "content": "replacement\n"})
+
+    assert "changed since you last read or wrote it" in result
+    assert file_path.read_text(encoding="utf-8") == "external\n"
+
+
+def test_write_file_rechecks_new_path_after_approval(tmp_path):
+    file_path = tmp_path / "new.txt"
+    agent = build_agent(tmp_path, [], approval_policy="ask")
+
+    def external_create_during_approval(name, args):
+        file_path.write_text("external\n", encoding="utf-8")
+        return True
+
+    with patch.object(agent, "approve", side_effect=external_create_during_approval):
+        result = agent.run_tool("write_file", {"path": "new.txt", "content": "replacement\n"})
+
+    assert "appeared while preparing the write" in result
+    assert file_path.read_text(encoding="utf-8") == "external\n"
+
+
+def test_patch_rejects_invalid_utf8_without_rewriting_unrelated_bytes(tmp_path):
+    file_path = tmp_path / "sample.bin"
+    original = b"\xff\nhello world\n"
+    file_path.write_bytes(original)
+    agent = build_agent(tmp_path, [])
+
+    result = agent.run_tool(
+        "patch_file",
+        {"path": "sample.bin", "old_text": "world", "new_text": "agent"},
+    )
+
+    assert "UnicodeDecodeError" in result
+    assert file_path.read_bytes() == original
+
+
+def test_patch_preserves_unrelated_lf_newlines_on_windows(tmp_path):
+    file_path = tmp_path / "sample.txt"
+    file_path.write_bytes(b"alpha\nhello world\nomega\n")
+    agent = build_agent(tmp_path, [])
+
+    result = agent.run_tool(
+        "patch_file",
+        {"path": "sample.txt", "old_text": "world", "new_text": "agent"},
+    )
+
+    assert result == "patched sample.txt"
+    assert file_path.read_bytes() == b"alpha\nhello agent\nomega\n"
+
+
+def test_patch_maps_multiline_target_without_normalizing_mixed_newlines(tmp_path):
+    file_path = tmp_path / "sample.txt"
+    file_path.write_bytes(b"keep-crlf\r\nstart\r\nmiddle\nend\rkeep-lf\n")
+    agent = build_agent(tmp_path, [])
+
+    result = agent.run_tool(
+        "patch_file",
+        {
+            "path": "sample.txt",
+            "old_text": "start\nmiddle\nend",
+            "new_text": "new-start\nnew-end",
+        },
+    )
+
+    assert result == "patched sample.txt"
+    assert file_path.read_bytes() == b"keep-crlf\r\nnew-start\r\nnew-end\rkeep-lf\n"
+
+
+def test_read_file_does_not_persist_oversized_snapshot(tmp_path):
+    file_path = tmp_path / "large.txt"
+    file_path.write_text("x" * 70_000 + "\n", encoding="utf-8")
+    agent = build_agent(tmp_path, [])
+
+    result = agent.run_tool("read_file", {"path": "large.txt", "start": 1, "end": 1})
+
+    assert "snapshot_id: unavailable" in result
+    assert agent.session["read_snapshots"] == {}
+
+
+def test_patch_rejects_changed_target_context(tmp_path):
     file_path = tmp_path / "sample.txt"
     file_path.write_text("hello world\n", encoding="utf-8")
     agent = build_agent(tmp_path, [])
@@ -275,8 +689,8 @@ def test_patch_rejects_stale_file_version(tmp_path):
         {"path": "sample.txt", "old_text": "world", "new_text": "agent"},
     )
 
-    assert "changed since you last read or wrote it" in result
-    assert agent._last_tool_result_metadata["tool_error_code"] == "stale_file_version"
+    assert "old_text not found" in result
+    assert agent._last_tool_result_metadata["tool_error_code"] == "patch_missing_context"
     # 文件保持外部改动后的内容，没有被静默改错
     assert file_path.read_text(encoding="utf-8") == "hello there\n"
 

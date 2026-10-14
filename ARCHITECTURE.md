@@ -29,7 +29,7 @@
 
 ### 0.2 一次 `ask()` 的完整生命周期
 
-`Pico.ask()`（[runtime.py:756](pico/runtime.py#L756)）是整个系统唯一的总调度器。CLI 收到用户输入后，本质上只做一件事——调用 `agent.ask()`。`ask()` 内部按下面顺序推进：
+`Pico.ask()`（[runtime.py:823](pico/runtime.py#L823)）是整个系统唯一的总调度器。CLI 收到用户输入后，本质上只做一件事——调用 `agent.ask()`。`ask()` 内部按下面顺序推进：
 
 1. **记忆初始化**：把用户请求写进 working memory 的 `task_summary`。
 2. **状态机创建**：`TaskState.create(...)`，并 `run_store.start_run(...)` 建立本次运行的目录。
@@ -222,10 +222,12 @@ FILE_SUMMARY_LIMIT = 6      # 渲染到 memory 仪表盘的文件摘要最多 6 
 - **`file_summaries`**：`{path: {summary, created_at, freshness}}`，记录文件读出来的短摘要，配合 freshness 做失效检测。
 
 > 注意 `task` / `files` / `notes` 是 `working` 的**镜像字段**，用于兼容磁盘上可能长成旧格式的状态；规范化层会把它们对齐到 `working`。
+>
+> `read_snapshots` 不属于 working memory，而是会话顶层的编辑安全状态：最多 16 项且单项最多 12,000 字符。每项保存路径、读取行范围、局部文本和读取时的原始字节 SHA256，供后续 Patch 做目标级重锚定；它不渲染进 memory prompt。若完整读取结果会被工具输出上限裁剪，则标记 `snapshot_id: unavailable` 且不保存隐藏上下文，模型应缩小读取范围后再 Patch。
 
 ### 2.3 工具结果如何沉淀进记忆
 
-`update_memory_after_tool()`（[runtime.py:642](pico/runtime.py#L642)）在**工具执行完之后、下一轮 prompt 组装之前**被调用，只把「下一轮大概率还会用到」的事实提纯：
+`update_memory_after_tool()`（[runtime.py:703](pico/runtime.py#L703)）在**工具执行完之后、下一轮 prompt 组装之前**被调用，只把「下一轮大概率还会用到」的事实提纯：
 
 - `read_file` / `write_file` / `patch_file` → `remember_file(path)`，把该文件移入 `recent_files`。
 - `read_file` → 生成短摘要（`summarize_read_result`：去掉首行 `# ` 标题，取正文前三行拼成 `" | "` 连接，裁到 180 字符），写进 `file_summaries` 并 append 一条 `episodic` 笔记。
@@ -274,11 +276,11 @@ FILE_SUMMARY_LIMIT = 6      # 渲染到 memory 仪表盘的文件摘要最多 6 
 
 ### 2.8 持久记忆的提取与拒绝
 
-提取入口 `extract_durable_promotions()`（[runtime.py:723](pico/runtime.py#L723)）：
+提取入口 `extract_durable_promotions()`（[runtime.py:790](pico/runtime.py#L790)）：
 
 1. **意图识别**：用户请求必须命中 `DURABLE_MEMORY_INTENT_PATTERN`（`capture/remember/save/store/persist/note`）或中文 `DURABLE_MEMORY_INTENT_ZH_PATTERN`（`记住/保存/记录/沉淀/长期记忆/持久记忆`），否则不做任何沉淀。
-2. **行模式匹配**：对最终答案逐行匹配 `DURABLE_MEMORY_LINE_PATTERNS`（[runtime.py:42](pico/runtime.py#L42)），支持英文 `Project convention:` / `Decision:` / `Dependency:` / `Preference:` 与中文 `项目约定：` / `决策：` / `依赖：` / `偏好：` 前缀。
-3. **拒绝规则** `reject_durable_reason()`（[runtime.py:695](pico/runtime.py#L695)）过滤四类噪音：
+2. **行模式匹配**：对最终答案逐行匹配 `DURABLE_MEMORY_LINE_PATTERNS`（[runtime.py:60](pico/runtime.py#L60)），支持英文 `Project convention:` / `Decision:` / `Dependency:` / `Preference:` 与中文 `项目约定：` / `决策：` / `依赖：` / `偏好：` 前缀。
+3. **拒绝规则** `reject_durable_reason()`（[runtime.py:762](pico/runtime.py#L762)）过滤四类噪音：
    - `empty`：空文本
    - `secret_shaped`：命中密钥形状正则（`api_key` / `token` / `secret` / `password` / `sk-...`）
    - `transient_task_state`：以 checkpoint 字段名开头（`current goal` / `当前目标` 等）
@@ -301,16 +303,16 @@ FILE_SUMMARY_LIMIT = 6      # 渲染到 memory 仪表盘的文件摘要最多 6 
 | 工具 | schema | risky | 说明 |
 | --- | --- | --- | --- |
 | `list_files` | `path="."` | 否 | 列出目录（最多 200 项，忽略 `IGNORED_PATH_NAMES`） |
-| `read_file` | `path`, `start=1`, `end=400` | 否 | 按行号范围读 UTF-8 文件，带行号回显 |
+| `read_file` | `path`, `start=1`, `end=400` | 否 | 按行号范围读 UTF-8 文件，带行号和 `snapshot_id` 回显 |
 | `search` | `pattern`, `path="."` | 否 | 优先 `rg -n --smart-case --max-count 200`，否则 Python 回退 |
 | `run_shell` | `command`, `timeout=20` | **是** | 在仓库根跑 shell，超时范围 [1,120]，输出裁剪 |
 | `write_file` | `path`, `content` | **是** | 写文本文件（自动建父目录） |
-| `patch_file` | `path`, `old_text`, `new_text` | **是** | 精确替换一处文本块 |
+| `patch_file` | `path`, `old_text`, `new_text`, `snapshot_id=None`, `target_line=None` | **是** | 精确替换文本块；可用读取快照消除重复文本歧义 |
 | `delegate` | `task`, `max_steps=6` | 否 | 派一个**只读**子 agent 调查 |
 
 ### 3.3 工具执行流水线
 
-`run_tool()`（[runtime.py:1000](pico/runtime.py#L1000)）是工具层的总闸口，**所有工具调用必须先经过它，不能让模型直接碰到底层函数**。流水线顺序：
+`run_tool()`（[runtime.py:1389](pico/runtime.py#L1389)）是工具层的总闸口，**所有工具调用必须先经过它，不能让模型直接碰到底层函数**。流水线顺序：
 
 ```
 工具是否存在 → 参数是否合法 → 是否重复调用 → 是否通过审批 → 真正执行 → 更新记忆
@@ -319,9 +321,9 @@ FILE_SUMMARY_LIMIT = 6      # 渲染到 memory 仪表盘的文件摘要最多 6 
 每一步的细节：
 
 1. **存在性**：`self.tools.get(name)` 为 `None` 则返回 `error: unknown tool`。
-2. **参数校验** `validate_tool`（[tools.py:82](pico/tools.py#L82)）：每个工具都有严格的参数校验，失败返回错误 + 示例调用。
-3. **重复检测** `repeated_tool_call`（[runtime.py:1129](pico/runtime.py#L1129)）：检查最近 `window = clamp(2..6, len(tool_events))` 次工具调用中，相同 `(name, args)` 是否已出现 ≥2 次。这样既能抓 `A→B→A→B` 交替循环，又不会误伤隔了很多步的回读。
-4. **审批** `approve`（[runtime.py:1201](pico/runtime.py#L1201)）：仅对 `risky` 工具触发，受 `approval_policy`（`ask`/`auto`/`never`）与 `read_only` 约束。
+2. **参数校验** `validate_tool`（[tools.py:88](pico/tools.py#L88)）：每个工具都有严格的参数校验，失败返回错误 + 示例调用。
+3. **重复检测** `repeated_tool_call`（[runtime.py:1589](pico/runtime.py#L1589)）：检查最近 `window = clamp(2..6, len(tool_events))` 次工具调用中，相同 `(name, args)` 是否已出现 ≥2 次。这样既能抓 `A→B→A→B` 交替循环，又不会误伤隔了很多步的回读。
+4. **审批** `approve`（[runtime.py:1663](pico/runtime.py#L1663)）：仅对 `risky` 工具触发，受 `approval_policy`（`ask`/`auto`/`never`）与 `read_only` 约束。
 5. **执行**：对 risky 工具先拍 `capture_workspace_snapshot()`，执行后 `diff_workspace_snapshots()` 算出受影响路径与 diff 摘要；`run_shell` 还会解析 `exit_code` 判定 `partial_success` / `error`。
 6. **记忆更新**：`update_memory_after_tool()`（§2.3）+ `record_process_note_for_tool()`（对 `partial_success` / `error` / `rejected` 写 `process` 类型笔记，供下一轮决策参考）。
 
@@ -331,7 +333,7 @@ FILE_SUMMARY_LIMIT = 6      # 渲染到 memory 仪表盘的文件摘要最多 6 
 
 #### 3.4.1 路径逃逸防护
 
-`Pico.path()`（[runtime.py:1341](pico/runtime.py#L1341)）把所有文件类工具锚定在 workspace root 之下：
+`Pico.path()`（[runtime.py:1814](pico/runtime.py#L1814)）把所有文件类工具锚定在 workspace root 之下：
 
 ```python
 resolved = path.resolve()
@@ -345,13 +347,18 @@ if os.path.commonpath([str(self.root), str(resolved)]) != str(self.root):
 
 - `read_only=True` 时，`approve()` 直接返回 `False`，任何 risky 工具都被拒绝（子 agent 即用此模式）。
 - `approval_policy="never"` 时拒绝所有 risky 工具；`"ask"` 时交互式询问 `[y/N]`；`"auto"` 时放行。
-- `patch_file` 要求 `old_text` 精确命中且**只能出现一次**，保证修改行为确定、失败原因易解释。
+- `write_file` 覆盖已有文件时使用整文件 SHA256 版本锁，文件变化即拒绝，避免覆盖外部修改。
+- 编辑版本锚定属于安全状态，即使关闭语义 `memory` 功能也持续更新；读取使用同一原始字节缓冲区计算 hash，避免“返回 A、却把随后出现的 B 记成已读版本”。
+- `patch_file` 的旧式调用仍要求当前 `old_text` 唯一命中；即使整文件 SHA256 因无关修改而变化，唯一目标仍可安全执行。
+- 首选调用携带 `read_file` 返回的 `snapshot_id` 与旧快照中的 `target_line`。文件未变时按快照位置定位；文件变化时先用完整读取片段、再用目标周围三行窗口做精确唯一重锚定。`target_line` 从不直接定位当前文件，也不会采用“最近行”猜测。
+- Patch 在规范化换行的视图中定位，但会映射回当前原始文本的精确字符范围，只替换目标区间；目标外的 LF、CRLF 或混合换行保持不变。
+- 快照缺失、路径不符、目标上下文消失或重锚后仍有多个候选时，分别返回可审计错误并保持文件不变。
 
 #### 3.4.3 敏感信息脱敏
 
 - `SENSITIVE_ENV_NAME_MARKERS = ("API_KEY", "TOKEN", "SECRET", "PASSWORD")`，配合 `secret_env_names` 白名单识别敏感环境变量。
-- `shell_env()`（[runtime.py:512](pico/runtime.py#L512)）给 `run_shell` 传入的是**过滤后的环境变量**（`DEFAULT_SHELL_ENV_ALLOWLIST`），而不是继承整个父 shell，减少敏感信息被意外带入命令执行环境。
-- `redact_artifact()`（[runtime.py:495](pico/runtime.py#L495)）递归地把 trace / report 里的敏感值替换为 `<redacted>`；`SECRET_SHAPED_TEXT_PATTERN` 还能识别 `sk-` 前缀的密钥形状文本。
+- `shell_env()`（[runtime.py:569](pico/runtime.py#L569)）给 `run_shell` 传入的是**过滤后的环境变量**（`DEFAULT_SHELL_ENV_ALLOWLIST`），而不是继承整个父 shell，减少敏感信息被意外带入命令执行环境。
+- `redact_artifact()`（[runtime.py:552](pico/runtime.py#L552)）递归地把 trace / report 里的敏感值替换为 `<redacted>`；`SECRET_SHAPED_TEXT_PATTERN` 还能识别 `sk-` 前缀的密钥形状文本。
 
 #### 3.4.4 工具结果元数据
 
@@ -359,7 +366,7 @@ if os.path.commonpath([str(self.root), str(resolved)]) != str(self.root):
 
 ### 3.5 delegate 子 agent
 
-`tool_delegate()`（[tools.py:265](pico/tools.py#L265)）派一个**受限**的 `Pico` 子实例：
+`tool_delegate()`（[tools.py:313](pico/tools.py#L313)）派一个**受限**的 `Pico` 子实例：
 
 - `approval_policy="never"`、`read_only=True`、`max_steps` 默认 6、`depth = parent.depth + 1`。
 - **一旦 `depth >= max_depth`，就连 `delegate` 这个工具都不再暴露**（`build_tool_registry` 里的条件注册），防止无限递归。
@@ -404,7 +411,7 @@ if os.path.commonpath([str(self.root), str(resolved)]) != str(self.root):
 
 ### 4.4 Checkpoint 结构
 
-`create_checkpoint()`（[runtime.py:601](pico/runtime.py#L601)）生成一份结构化的现场快照：
+`create_checkpoint()`（[runtime.py:662](pico/runtime.py#L662)）生成一份结构化的现场快照：
 
 ```python
 {
@@ -440,7 +447,7 @@ Checkpoint 存于 `session["checkpoints"]`，结构为 `{current_id, items: {id:
 
 ### 4.6 恢复状态评估
 
-`evaluate_resume_state()`（[runtime.py:211](pico/runtime.py#L211)）在每次 `_build_prompt_and_metadata` 时运行，产出五种状态：
+`evaluate_resume_state()`（[runtime.py:267](pico/runtime.py#L267)）在每次 `_build_prompt_and_metadata` 时运行，产出五种状态：
 
 | status | 含义 | 判定条件 |
 | --- | --- | --- |
@@ -450,15 +457,15 @@ Checkpoint 存于 `session["checkpoints"]`，结构为 `{current_id, items: {id:
 | `workspace-mismatch` | 运行时身份漂移 | `runtime_identity` 各字段（cwd/model/approval/feature_flags/tool_signature/workspace_fingerprint…）不一致 |
 | `full-valid` | 完全有效 | 上述都通过 |
 
-**runtime_identity**（[runtime.py:179](pico/runtime.py#L179)）是判断「这次恢复是否还是同一个环境」的指纹，涵盖 `cwd`、`model`、`model_client`、`approval_policy`、`read_only`、`max_steps`、`max_new_tokens`、`feature_flags`、`shell_env_allowlist`、`workspace_fingerprint`、`tool_signature` 十一个维度。任意一项漂移都会让 `workspace-mismatch` 状态浮现。
+**runtime_identity**（[runtime.py:235](pico/runtime.py#L235)）是判断「这次恢复是否还是同一个环境」的指纹，涵盖 `cwd`、`model`、`model_client`、`approval_policy`、`read_only`、`max_steps`、`max_new_tokens`、`feature_flags`、`shell_env_allowlist`、`workspace_fingerprint`、`tool_signature` 十一个维度。任意一项漂移都会让 `workspace-mismatch` 状态浮现。
 
 ### 4.7 恢复文本如何进入 prompt
 
-`render_checkpoint_text()`（[runtime.py:273](pico/runtime.py#L273)）把当前 checkpoint 渲染成一段「Task checkpoint」文本，内容包括 `Resume status`、`Current goal`、`Current blocker`、`Next step`、`Key files`、`Completed/Excluded`、`Stale paths`、`Summary`。这段文本被拼进 prompt 的 `prefix` section（§1.5.1），让模型**显式感知自己正在从哪个断点恢复**。
+`render_checkpoint_text()`（[runtime.py:329](pico/runtime.py#L329)）把当前 checkpoint 渲染成一段「Task checkpoint」文本，内容包括 `Resume status`、`Current goal`、`Current blocker`、`Next step`、`Key files`、`Completed/Excluded`、`Stale paths`、`Summary`。这段文本被拼进 prompt 的 `prefix` section（§1.5.1），让模型**显式感知自己正在从哪个断点恢复**。
 
 ### 4.8 恢复流程
 
-- `Pico.from_session()`（[runtime.py:153](pico/runtime.py#L153)）从 `session_store.load(session_id)` 恢复。
+- `Pico.from_session()`（[runtime.py:177](pico/runtime.py#L177)）从 `session_store.load(session_id)` 恢复。
 - CLI 的 `--resume <id|latest>`（[cli.py:231](pico/cli.py#L231)）触发恢复；`latest` 取 `store.latest()`（按 mtime 最新的 session）。
 - 恢复时 `invalidate_stale_memory()` 会先把过期文件摘要清掉，再评估 checkpoint 状态，把 `resume_status` 写进新 TaskState 与 report。
 

@@ -10,8 +10,8 @@ Pico 的 harness v1 概览：一个把模型输出约束到可审计动作集合
 ## 关键约束
 
 - **能力白名单**：工具是显式注册的，模型只能申请清单内的动作。
-- **安全护栏管线**：validate（参数形状）→ version-guard（编辑版本锚定，拒绝
-  过期文件 / 缺失上下文 / 多处匹配）→ repeated-detection（重复调用检测）→
+- **安全护栏管线**：validate（参数形状）→ version-guard（整文件写入使用严格
+  版本锁，Patch 使用读取快照做目标级重锚定，无法证明唯一目标时拒绝）→ repeated-detection（重复调用检测）→
   approve（审批策略）→ execute。
 - **secret 脱敏**：trace/report 里的敏感环境变量值一律替换为 `<redacted>`。
 

@@ -40,6 +40,9 @@ DEFAULT_FEATURE_FLAGS = {
 LOW_PROGRESS_THRESHOLD = 3
 # 单次运行最多注入几次重新规划提示，防止「反思」本身变成新的死循环。
 MAX_REPLANS = 2
+READ_SNAPSHOT_LIMIT = 16
+READ_SNAPSHOT_MAX_CHARS = 12_000
+PATCH_CONTEXT_LINES = 3
 REPLAN_PROMPT = (
     "You appear to be making little progress. Stop and reassess: "
     "what is the current goal, what have you already tried, what is blocking you, "
@@ -160,6 +163,9 @@ class Pico:
         self.last_durable_rejections = []
         self.last_durable_superseded = []
         self._last_tool_result_metadata = {}
+        self._pending_patch = None
+        self._pending_write = None
+        self._observed_file_hash = None
         self._last_prefix_refresh = {
             "workspace_changed": False,
             "prefix_changed": False,
@@ -180,6 +186,39 @@ class Pico:
     def _ensure_session_shape(self):
         self.session.setdefault("history", [])
         self.session.setdefault("memory", memorylib.default_memory_state())
+        read_snapshots = self.session.setdefault("read_snapshots", {})
+        if not isinstance(read_snapshots, dict):
+            read_snapshots = {}
+            self.session["read_snapshots"] = read_snapshots
+        normalized_snapshots = {}
+        for snapshot_id, snapshot in list(read_snapshots.items())[-READ_SNAPSHOT_LIMIT:]:
+            if not isinstance(snapshot, dict):
+                continue
+            content = snapshot.get("content")
+            path = snapshot.get("path")
+            start = snapshot.get("start")
+            end = snapshot.get("end")
+            file_hash = snapshot.get("file_hash")
+            if not re.fullmatch(r"read_[0-9a-f]{12}", str(snapshot_id)):
+                continue
+            if not isinstance(path, str) or not path.strip() or len(path) > 4096:
+                continue
+            if not isinstance(start, int) or isinstance(start, bool) or start < 1:
+                continue
+            if not isinstance(end, int) or isinstance(end, bool) or end < start:
+                continue
+            if not isinstance(content, str) or len(content) > READ_SNAPSHOT_MAX_CHARS:
+                continue
+            if not isinstance(file_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", file_hash):
+                continue
+            normalized_snapshots[str(snapshot_id)] = {
+                "path": path,
+                "start": start,
+                "end": end,
+                "content": content,
+                "file_hash": file_hash,
+            }
+        self.session["read_snapshots"] = normalized_snapshots
         checkpoints = self.session.setdefault("checkpoints", {})
         if not isinstance(checkpoints, dict):
             checkpoints = {}
@@ -349,7 +388,7 @@ class Pico:
                 '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
                 '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>',
                 '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
-                '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
+                '<tool name="patch_file" path="binary_search.py" snapshot_id="read_a1b2c3d4e5f6" target_line="12"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
                 '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
                 "<final>Done.</final>",
             ]
@@ -372,6 +411,7 @@ class Pico:
             - Never invent tool results.
             - Keep answers concise and concrete.
             - If the user asks you to create or update a specific file and the path is clear, use write_file or patch_file instead of repeatedly listing files.
+            - After read_file, reuse its snapshot_id and the displayed target line in patch_file. A line number identifies the old snapshot only; never guess a current target from proximity. If snapshot_id is unavailable, read a narrower range first.
             - Before writing tests for existing code, read the implementation first.
             - When writing tests, match the current implementation unless the user explicitly asked you to change the code.
             - New files should be complete and runnable, including obvious imports.
@@ -676,21 +716,23 @@ class Pico:
         它发生在 `run_tool()` 真正执行完工具之后、下一轮 prompt 组装之前。
         也就是说：工具结果先进入完整历史，再由这个函数择优沉淀成轻量记忆。
         """
-        if not self.feature_enabled("memory"):
-            return
         path = args.get("path")
         if not path:
             return
 
         canonical_path = self.memory.canonical_path(path)
+        # 文件版本是编辑安全状态，即使关闭语义 memory 也必须更新。
+        if name in {"read_file", "write_file", "patch_file"}:
+            observed = self._observed_file_hash
+            digest = observed[1] if observed and observed[0] == canonical_path else None
+            self.memory.remember_file_hash(canonical_path, digest=digest)
+        if not self.feature_enabled("memory"):
+            return
+
         # 不是所有工具结果都进入工作记忆。
         # 读文件会生成摘要；写文件/patch 会让旧摘要失效，因为它们可能过期了。
         if name in {"read_file", "write_file", "patch_file"}:
             self.memory.remember_file(canonical_path)
-            # 记录“文件当前版本的 hash”，供 guard_edit 在执行编辑前做版本锚定：
-            # 一旦文件在模型读写之后又变了，就能在执行前发现并拒绝，而不是
-            # 基于旧快照静默改错位置。
-            self.memory.remember_file_hash(canonical_path)
         if name == "read_file":
             summary = memorylib.summarize_read_result(result)
             self.memory.set_file_summary(canonical_path, summary)
@@ -1047,8 +1089,9 @@ class Pico:
         """编辑工具执行前的版本锚定 + 目标定位检查。
 
         对应“可靠工具调用”的两个子问题：
-        - 文件版本过期：模型基于旧快照编辑，需要在执行前发现并拒绝；
-        - 目标上下文不存在 / 多处匹配：给出足够信息让模型一轮内重新锚定。
+        - write_file 基于旧版本覆盖文件时必须拒绝；
+        - patch_file 即使文件整体变化，也可通过 old_text 或读取快照证明目标身份；
+        - 目标上下文不存在 / 无法唯一定位时，拒绝而不是猜测旧行号附近的位置。
 
         返回 (message, error_code) 表示应该拒绝本次编辑并回传该信息；
         返回 None 表示可以继续执行。
@@ -1063,8 +1106,9 @@ class Pico:
         except ValueError:
             return None  # path escape 由 validate_tool / 执行层报
 
-        # write_file 新建文件没有“版本过期”问题
-        if name == "write_file" and not path.exists():
+        path_exists = path.exists()
+        if name == "write_file" and not path_exists:
+            self._pending_write = {"path": self.memory.canonical_path(raw_path), "exists": False, "hash": None}
             return None
         if not path.is_file():
             return None  # validate_tool 会拒绝非文件
@@ -1072,23 +1116,49 @@ class Pico:
         canonical = self.memory.canonical_path(raw_path)
         current_hash = memorylib.file_freshness(canonical, self.root)
 
-        # 1) 版本锚定：文件在模型上次读写之后又变了
+        self._pending_patch = None
+
+        # write_file 会覆盖整个文件，所以仍然使用严格的整文件版本锚定。
         last_seen = self.memory.last_seen_hash(canonical)
-        if last_seen and current_hash and last_seen != current_hash:
+        if name == "write_file" and last_seen and current_hash and last_seen != current_hash:
             return (
                 f"error: {canonical} changed since you last read or wrote it "
                 f"(last-seen {last_seen[:8]} != current {current_hash[:8]}); "
                 "re-read the file before editing.",
                 "stale_file_version",
             )
-
-        # 2) 目标定位：patch_file 的 old_text 必须精确命中且唯一
-        if name != "patch_file":
+        if name == "write_file":
+            self._pending_write = {"path": canonical, "exists": True, "hash": current_hash}
             return None
+
         old_text = str(args.get("old_text", ""))
         if not old_text:
             return None  # validate_tool 拒绝空 old_text
-        text = path.read_text(encoding="utf-8", errors="replace")
+        raw = path.read_bytes()
+        raw_text = raw.decode("utf-8")
+        text, offsets = self.normalize_newlines(raw_text)
+        # Patch 的版本必须绑定到刚刚用于定位的同一份文本缓冲区，不能再读一次
+        # 文件计算 hash，否则外部修改可能落在两次读取之间。
+        current_hash = self.bytes_hash(raw)
+        raw_snapshot_id = args.get("snapshot_id")
+        snapshot_id = "" if raw_snapshot_id is None else str(raw_snapshot_id).strip()
+        target_line = args.get("target_line")
+        if snapshot_id:
+            resolved = self.resolve_snapshot_patch(
+                canonical,
+                text,
+                current_hash,
+                old_text,
+                snapshot_id,
+                int(target_line),
+            )
+            if isinstance(resolved, tuple):
+                return resolved
+            self.prepare_pending_patch(canonical, current_hash, raw_text, offsets, resolved, len(old_text))
+            return None
+
+        # 兼容旧调用：即使整文件发生无关变化，只要 old_text 在当前内容中仍然
+        # 唯一，就把它本身当作 compare-and-swap 目标锚点。
         matches = toolkit.locate_old_text(text, old_text)
         if not matches:
             head = "\n".join(
@@ -1110,7 +1180,211 @@ class Pico:
                 "provide more surrounding context to disambiguate:\n" + listing,
                 "patch_ambiguous",
             )
+        self.prepare_pending_patch(
+            canonical,
+            current_hash,
+            raw_text,
+            offsets,
+            self._match_indexes(text, old_text)[0],
+            len(old_text),
+        )
         return None
+
+    @staticmethod
+    def _match_indexes(text, needle):
+        indexes = []
+        start = 0
+        while needle:
+            index = text.find(needle, start)
+            if index < 0:
+                break
+            indexes.append(index)
+            start = index + len(needle)
+        return indexes
+
+    @staticmethod
+    def _line_for_offset(text, offset, first_line=1):
+        return first_line + text.count("\n", 0, offset)
+
+    @staticmethod
+    def _line_window(text, offset, length, radius=PATCH_CONTEXT_LINES):
+        start = offset
+        for _ in range(radius):
+            previous = text.rfind("\n", 0, max(0, start - 1))
+            if previous < 0:
+                start = 0
+                break
+            start = previous + 1
+        end = offset + length
+        for _ in range(radius):
+            following = text.find("\n", end)
+            if following < 0:
+                end = len(text)
+                break
+            end = following + 1
+        return text[start:end], offset - start
+
+    def capture_read_snapshot(self, raw_path, start, end, text, file_hash):
+        canonical = self.memory.canonical_path(raw_path)
+        lines = text.splitlines(keepends=True)
+        content = "".join(lines[start - 1:end])
+        if len(content) > READ_SNAPSHOT_MAX_CHARS:
+            return "unavailable"
+        payload = f"{canonical}\0{file_hash}\0{start}\0{end}\0{content}"
+        snapshot_id = "read_" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+        snapshots = self.session.setdefault("read_snapshots", {})
+        snapshots.pop(snapshot_id, None)
+        snapshots[snapshot_id] = {
+            "path": canonical,
+            "start": start,
+            "end": end,
+            "content": content,
+            "file_hash": file_hash,
+        }
+        while len(snapshots) > READ_SNAPSHOT_LIMIT:
+            snapshots.pop(next(iter(snapshots)))
+        return snapshot_id
+
+    def observe_file_version(self, raw_path, digest):
+        canonical = self.memory.canonical_path(raw_path)
+        self._observed_file_hash = (canonical, digest)
+
+    def resolve_snapshot_patch(self, canonical, text, current_hash, old_text, snapshot_id, target_line):
+        snapshot = self.session.get("read_snapshots", {}).get(snapshot_id)
+        if not snapshot:
+            return (f"error: read snapshot {snapshot_id} is unavailable; re-read {canonical}.", "patch_snapshot_missing")
+        if snapshot.get("path") != canonical:
+            return (f"error: read snapshot {snapshot_id} belongs to a different file.", "patch_snapshot_mismatch")
+
+        snapshot_text = str(snapshot.get("content", ""))
+        snapshot_start = int(snapshot.get("start", 1))
+        anchored = [
+            index for index in self._match_indexes(snapshot_text, old_text)
+            if self._line_for_offset(snapshot_text, index, snapshot_start) == target_line
+        ]
+        if len(anchored) != 1:
+            return (
+                f"error: target_line {target_line} does not identify exactly one old_text in snapshot {snapshot_id}.",
+                "patch_invalid_anchor",
+            )
+        old_index = anchored[0]
+
+        if snapshot.get("file_hash") == current_hash:
+            line_start = 0
+            for _ in range(target_line - 1):
+                line_start = text.find("\n", line_start) + 1
+            column = old_index - (snapshot_text.rfind("\n", 0, old_index) + 1)
+            current_index = line_start + column
+            if text[current_index:current_index + len(old_text)] == old_text:
+                return current_index
+            return ("error: snapshot target no longer matches old_text.", "patch_missing_context")
+
+        # First try relocating the complete range the model actually read. This preserves
+        # occurrence identity even when old_text itself appears many times.
+        range_matches = self._match_indexes(text, snapshot_text)
+        if len(range_matches) == 1:
+            return range_matches[0] + old_index
+        if len(range_matches) > 1:
+            return (
+                f"error: snapshot range occurs {len(range_matches)} times in {canonical}; cannot uniquely re-anchor it.",
+                "patch_ambiguous",
+            )
+
+        # If something else inside the read range changed, fall back to a small exact
+        # window around the old target. Never select by nearest line.
+        window, relative_index = self._line_window(snapshot_text, old_index, len(old_text))
+        window_matches = self._match_indexes(text, window)
+        if len(window_matches) == 1:
+            return window_matches[0] + relative_index
+        if len(window_matches) > 1:
+            return (
+                f"error: target context occurs {len(window_matches)} times in {canonical}; cannot uniquely re-anchor it.",
+                "patch_ambiguous",
+            )
+        return (
+            f"error: target context from snapshot {snapshot_id} no longer exists in {canonical}; re-read the target region.",
+            "patch_missing_context",
+        )
+
+    @staticmethod
+    def bytes_hash(content):
+        return hashlib.sha256(content).hexdigest()
+
+    @staticmethod
+    def decode_text(content, errors="strict"):
+        # Match Path.read_text/newline=None semantics while keeping the raw bytes
+        # available for an exact version hash.
+        return Pico.normalize_newlines(content.decode("utf-8", errors=errors))[0]
+
+    @staticmethod
+    def normalize_newlines(text):
+        normalized = []
+        offsets = [0]
+        index = 0
+        while index < len(text):
+            if text[index] == "\r":
+                index += 2 if index + 1 < len(text) and text[index + 1] == "\n" else 1
+                normalized.append("\n")
+            else:
+                normalized.append(text[index])
+                index += 1
+            offsets.append(index)
+        return "".join(normalized), offsets
+
+    def prepare_pending_patch(self, canonical, current_hash, raw_text, offsets, index, length):
+        self._pending_patch = {
+            "path": canonical,
+            "hash": current_hash,
+            "raw_text": raw_text,
+            "start": offsets[index],
+            "end": offsets[index + length],
+        }
+
+    @staticmethod
+    def replacement_newline(raw_text, start, end):
+        target = raw_text[start:end]
+        for candidate in ("\r\n", "\n", "\r"):
+            if candidate in target:
+                return candidate
+        match = re.search(r"\r\n|\r|\n", raw_text)
+        return match.group(0) if match else os.linesep
+
+    def commit_text(self, path, text):
+        encoded = text.replace("\n", os.linesep).encode("utf-8") if os.linesep != "\n" else text.encode("utf-8")
+        Path(path).write_bytes(encoded)
+        canonical = self.memory.canonical_path(path)
+        self._observed_file_hash = (canonical, self.bytes_hash(encoded))
+
+    def commit_patch(self, path, pending, new_text):
+        raw_text = pending["raw_text"]
+        newline = self.replacement_newline(raw_text, pending["start"], pending["end"])
+        normalized_new_text = self.normalize_newlines(str(new_text))[0]
+        replacement = normalized_new_text.replace("\n", newline)
+        updated = raw_text[:pending["start"]] + replacement + raw_text[pending["end"]:]
+        encoded = updated.encode("utf-8")
+        Path(path).write_bytes(encoded)
+        canonical = self.memory.canonical_path(path)
+        self._observed_file_hash = (canonical, self.bytes_hash(encoded))
+
+    def pending_patch(self, path):
+        canonical = self.memory.canonical_path(path)
+        pending = self._pending_patch
+        if not pending or pending.get("path") != canonical:
+            return None
+        return pending
+
+    def verify_pending_write(self, path):
+        canonical = self.memory.canonical_path(path)
+        pending = self._pending_write
+        if not pending or pending.get("path") != canonical:
+            raise ValueError("write was not version-guarded")
+        if not pending["exists"]:
+            if Path(path).exists():
+                raise ValueError("file appeared while preparing the write; retry from a fresh read")
+            return
+        current_hash = memorylib.file_freshness(canonical, self.root)
+        if current_hash != pending["hash"]:
+            raise ValueError("file changed again while preparing the write; retry from a fresh read")
 
     def run_tool(self, name, args):
         """执行一次工具调用，并在执行前后套上完整护栏。
@@ -1134,6 +1408,9 @@ class Pico:
         # 工具执行不是“直接调函数”，而是一条带护栏的流水线：
         # 工具是否存在 -> 参数是否合法 -> 是否重复调用 -> 是否通过审批
         # -> 真正执行 -> 更新记忆。
+        self._pending_patch = None
+        self._pending_write = None
+        self._observed_file_hash = None
         tool = self.tools.get(name)
         if tool is None:
             self._last_tool_result_metadata = {
@@ -1166,7 +1443,20 @@ class Pico:
                 "diff_summary": [],
             }
             return message
-        edit_guard = self.guard_edit(name, args)
+        try:
+            edit_guard = self.guard_edit(name, args)
+        except Exception as exc:
+            self._last_tool_result_metadata = {
+                "tool_status": "error",
+                "tool_error_code": "edit_preparation_failed",
+                "security_event_type": "",
+                "risk_level": "high" if tool["risky"] else "low",
+                "read_only": not tool["risky"],
+                "affected_paths": [],
+                "workspace_changed": False,
+                "diff_summary": [],
+            }
+            return f"error: could not prepare {name}: {type(exc).__name__}: {exc}"
         if edit_guard:
             message, error_code = edit_guard
             affected_paths = []
@@ -1459,7 +1749,17 @@ class Pico:
 
         body = match.group("body")
         args = dict(attrs)
-        for key in ("content", "old_text", "new_text", "command", "task", "pattern", "path"):
+        for key in (
+            "content",
+            "old_text",
+            "new_text",
+            "snapshot_id",
+            "target_line",
+            "command",
+            "task",
+            "pattern",
+            "path",
+        ):
             if f"<{key}>" in body:
                 args[key] = Pico.extract_raw(body, key)
 
@@ -1505,6 +1805,7 @@ class Pico:
 
     def reset(self):
         self.session["history"] = []
+        self.session["read_snapshots"] = {}
         self.session["memory"].clear()
         self.session["memory"].update(memorylib.default_memory_state())
         self.memory = memorylib.LayeredMemory(self.session["memory"], workspace_root=self.root)

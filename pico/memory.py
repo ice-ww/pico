@@ -460,12 +460,12 @@ def remember_file(state, path, workspace_root=None):
     return state
 
 
-def remember_file_hash(state, path, workspace_root=None):
+def remember_file_hash(state, path, workspace_root=None, digest=None):
     state = normalize_memory_state(state, workspace_root)
     path = canonicalize_path(path, workspace_root).strip()
     if not path:
         return state
-    digest = file_freshness(path, workspace_root)
+    digest = str(digest).strip() if digest is not None else file_freshness(path, workspace_root)
     if digest is None:
         return state
     hashes = state["last_seen_hashes"]
@@ -656,8 +656,8 @@ class LayeredMemory:
         self.state = remember_file(self.state, path, self.workspace_root)
         return self
 
-    def remember_file_hash(self, path):
-        self.state = remember_file_hash(self.state, path, self.workspace_root)
+    def remember_file_hash(self, path, digest=None):
+        self.state = remember_file_hash(self.state, path, self.workspace_root, digest=digest)
         return self
 
     def last_seen_hash(self, path):
