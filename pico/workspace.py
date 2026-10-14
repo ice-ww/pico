@@ -71,11 +71,13 @@ class WorkspaceContext:
             except Exception:
                 return fallback
 
-        repo_root = (
-            Path(repo_root_override).resolve()
-            if repo_root_override is not None
-            else Path(git(["rev-parse", "--show-toplevel"], str(cwd))).resolve()
-        )
+        if repo_root_override is not None:
+            repo_root = Path(repo_root_override).resolve()
+        else:
+            top_level = git(["rev-parse", "--show-toplevel"], str(cwd))
+            # cwd 不在 git 仓库里时 git 返回空串；此时 Path("").resolve() 会解析成
+            # 进程当前目录（而不是 cwd），导致 repo_root 指错。这里显式回退到 cwd。
+            repo_root = Path(top_level).resolve() if top_level else cwd
         docs = {}
         # 同时扫描 repo_root 和 cwd，这样在子目录启动时也能看到本地文档；
         # 但用相对路径做 key，避免同一份文档被重复收集。

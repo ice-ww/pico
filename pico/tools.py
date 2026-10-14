@@ -9,7 +9,7 @@ import subprocess
 import textwrap
 from functools import partial
 
-from .workspace import IGNORED_PATH_NAMES, clip
+from .workspace import IGNORED_PATH_NAMES, MAX_TOOL_OUTPUT, clip
 
 BASE_TOOL_SPECS = {
     "list_files": {
@@ -38,9 +38,15 @@ BASE_TOOL_SPECS = {
         "description": "Write a text file.",
     },
     "patch_file": {
-        "schema": {"path": "str", "old_text": "str", "new_text": "str"},
+        "schema": {
+            "path": "str",
+            "old_text": "str",
+            "new_text": "str",
+            "snapshot_id": "str=None",
+            "target_line": "int=None",
+        },
         "risky": True,
-        "description": "Replace one exact text block in a file.",
+        "description": "Replace one exact text block, preferably anchored to a read snapshot.",
     },
 }
 
@@ -56,7 +62,7 @@ TOOL_EXAMPLES = {
     "search": '<tool>{"name":"search","args":{"pattern":"binary_search","path":"."}}</tool>',
     "run_shell": '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
     "write_file": '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
-    "patch_file": '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
+    "patch_file": '<tool name="patch_file" path="binary_search.py" snapshot_id="read_a1b2c3d4e5f6" target_line="12"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
     "delegate": '<tool>{"name":"delegate","args":{"task":"inspect README.md","max_steps":3}}</tool>',
 }
 
@@ -123,8 +129,9 @@ def validate_tool(agent, name, args):
         return
 
     if name == "patch_file":
-        # patch_file 故意做得很严格：old_text 必须精确命中且只能出现一次，
-        # 这样修改行为才是确定的，失败原因也更容易解释。
+        # 这里只校验参数形状；old_text 是否精确且唯一命中，交给 run_tool 的
+        # guard_edit 在执行前做版本锚定 + 目标定位检查——这样报错能带上行号与
+        # 上下文，帮助模型一轮内重新锚定，而不是对着一个含糊的报错干猜。
         path = agent.path(args["path"])
         if not path.is_file():
             raise ValueError("path is not a file")
@@ -133,10 +140,13 @@ def validate_tool(agent, name, args):
             raise ValueError("old_text must not be empty")
         if "new_text" not in args:
             raise ValueError("missing new_text")
-        text = path.read_text(encoding="utf-8")
-        count = text.count(old_text)
-        if count != 1:
-            raise ValueError(f"old_text must occur exactly once, found {count}")
+        raw_snapshot_id = args.get("snapshot_id")
+        snapshot_id = "" if raw_snapshot_id is None else str(raw_snapshot_id).strip()
+        has_target_line = args.get("target_line") not in (None, "")
+        if bool(snapshot_id) != has_target_line:
+            raise ValueError("snapshot_id and target_line must be provided together")
+        if has_target_line and int(args["target_line"]) < 1:
+            raise ValueError("target_line must be >= 1")
         return
 
     if name == "delegate":
@@ -169,9 +179,17 @@ def tool_read_file(agent, args):
     end = int(args.get("end", 400))
     if start < 1 or end < start:
         raise ValueError("invalid line range")
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    raw = path.read_bytes()
+    text = agent.decode_text(raw, errors="replace")
+    raw_hash = agent.bytes_hash(raw)
+    agent.observe_file_version(args["path"], raw_hash)
+    lines = text.splitlines()
     body = "\n".join(f"{number:>4}: {line}" for number, line in enumerate(lines[start - 1:end], start=start))
-    return f"# {path.relative_to(agent.root)}\n{body}"
+    if len(body) + 128 > MAX_TOOL_OUTPUT:
+        snapshot_id = "unavailable"
+    else:
+        snapshot_id = agent.capture_read_snapshot(args["path"], start, end, text, raw_hash)
+    return f"# {path.relative_to(agent.root)} [snapshot_id: {snapshot_id}; lines {start}-{end}]\n{body}"
 
 
 def tool_search(agent, args):
@@ -240,9 +258,35 @@ def tool_run_shell(agent, args):
 def tool_write_file(agent, args):
     path = agent.path(args["path"])
     content = str(args["content"])
+    agent.verify_pending_write(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+    agent.commit_text(path, content)
     return f"wrote {path.relative_to(agent.root)} ({len(content)} chars)"
+
+
+def locate_old_text(text, old_text):
+    """定位 old_text 在 text 里的每一次出现，返回 (行号, 行内容) 列表。
+
+    用于 patch_file 的“多处匹配”与“目标不存在”诊断：给模型看每个匹配点的
+    行号和内容，让它能靠更多上下文消歧，而不是对着一个含糊的报错干猜。
+    """
+    if not old_text:
+        return []
+    matches = []
+    start = 0
+    while True:
+        index = text.find(old_text, start)
+        if index == -1:
+            break
+        line_number = text.count("\n", 0, index) + 1
+        line_start = text.rfind("\n", 0, index) + 1
+        line_end = text.find("\n", index)
+        if line_end == -1:
+            line_end = len(text)
+        line = text[line_start:line_end].strip()
+        matches.append((line_number, line))
+        start = index + len(old_text)
+    return matches
 
 
 def tool_patch_file(agent, args):
@@ -254,11 +298,15 @@ def tool_patch_file(agent, args):
         raise ValueError("old_text must not be empty")
     if "new_text" not in args:
         raise ValueError("missing new_text")
-    text = path.read_text(encoding="utf-8")
-    count = text.count(old_text)
-    if count != 1:
-        raise ValueError(f"old_text must occur exactly once, found {count}")
-    path.write_text(text.replace(old_text, str(args["new_text"]), 1), encoding="utf-8")
+    pending = agent.pending_patch(path)
+    current_raw = path.read_bytes()
+    current_hash = agent.bytes_hash(current_raw)
+    if not pending or pending["hash"] != current_hash:
+        raise ValueError("file changed again while preparing the patch; retry from a fresh read")
+    raw_target = pending["raw_text"][pending["start"]:pending["end"]]
+    if agent.normalize_newlines(raw_target)[0] != old_text:
+        raise ValueError("resolved patch target no longer matches old_text")
+    agent.commit_patch(path, pending, args["new_text"])
     return f"patched {path.relative_to(agent.root)}"
 
 

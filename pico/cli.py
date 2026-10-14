@@ -221,9 +221,10 @@ def build_agent(args):
     # 这里是 CLI 到 runtime 的装配点：
     # 先采集工作区快照和加载项目级环境，再整理 secret 名单、模型后端和 session。
     workspace = WorkspaceContext.build(args.cwd)
-    # 先尝试从工作区根目录加载 .env（项目级配置），
-    # 如果工作区没有 .env，则回退到 pico 启动时的当前目录。
-    if not load_project_env(workspace.repo_root):
+    # 先尝试从工作区根目录加载 .env（项目级配置）。
+    # 只有当用户没有显式指定 --cwd（即默认 "."）时，才回退到 pico 启动目录；
+    # 显式指定了工作区却去读无关目录的 .env，容易把不该带进来的 secret 注入进来。
+    if not load_project_env(workspace.repo_root) and getattr(args, "cwd", ".") == ".":
         load_project_env(os.getcwd())
     configured_secret_names = _configured_secret_names(args)
     store = SessionStore(workspace.repo_root + "/.pico/sessions")

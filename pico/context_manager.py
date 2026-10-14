@@ -309,6 +309,7 @@ class ContextManager:
                     "collapsed_duplicate_reads": 0,
                     "reused_file_summary_count": 0,
                     "summarized_tool_count": 0,
+                    "aggregated_older_summary": False,
                 },
             )
 
@@ -316,7 +317,9 @@ class ContextManager:
         recent_window = 10
         recent_start = max(0, len(history) - recent_window)
         history_entries, history_details = self._compressed_history_entries(history, recent_start)
+        history_details.setdefault("aggregated_older_summary", False)
         rendered_entries = []
+        dropped_older = False
         for entry in reversed(history_entries):
             recent = bool(entry.get("recent", False))
             candidate_lines = list(entry.get("lines", []))
@@ -341,10 +344,45 @@ class ContextManager:
                 smaller_rendered = "\n".join(["Transcript:", *smaller_entries])
                 if len(smaller_rendered) <= budget:
                     rendered_entries = smaller_entries
+                else:
+                    # 旧历史条目被贪心丢弃：这正是 Level 2 聚合摘要要抢救的信息。
+                    dropped_older = True
         rendered = "\n".join(["Transcript:", *rendered_entries])
 
+        # Level 2：Level 1 在预算内塞不下旧历史、开始丢弃旧条目时，
+        # 用聚合摘要替代那批旧条目，把旧历史体积从 O(n) 降到 O(1)，而不是丢信息。
+        if dropped_older and recent_start > 0:
+            summary_text, summary_details = self._aggregate_history_summary(history, recent_start)
+            history_details.update(summary_details)
+            history_details["aggregated_older_summary"] = True
+            recent_entries = [entry for entry in reversed(history_entries) if entry.get("recent")]
+            # 先按 Level 1 的策略塞 recent（新→旧，塞不下就裁剪）。
+            level2_rendered_entries = []
+            for entry in recent_entries:
+                candidate_lines = list(entry.get("lines", []))
+                candidate_entries = candidate_lines + level2_rendered_entries
+                candidate_rendered = "\n".join(["Transcript:", *candidate_entries])
+                if len(candidate_rendered) <= budget:
+                    level2_rendered_entries = candidate_entries
+                    continue
+                available = budget - len("Transcript:")
+                if level2_rendered_entries:
+                    available -= len("\n".join(level2_rendered_entries)) + 1
+                available = max(20, available - 1)
+                trimmed = [_tail_clip(line, available) for line in candidate_lines]
+                candidate_entries = trimmed + level2_rendered_entries
+                if len("\n".join(["Transcript:", *candidate_entries])) <= budget:
+                    level2_rendered_entries = candidate_entries
+            # 摘要块用「剩余空间」精确截断后 append 到末尾（最旧），保证一定塞得下。
+            current_len = len("\n".join(["Transcript:", *level2_rendered_entries]))
+            remaining = budget - current_len - 1
+            if remaining > 0:
+                level2_rendered_entries = level2_rendered_entries + [_tail_clip(summary_text, remaining)]
+            rendered = "\n".join(["Transcript:", *level2_rendered_entries])
+            rendered_entries = level2_rendered_entries
+
         if len(rendered) > budget and budget > 0:
-            rendered = _tail_clip(raw, budget)
+            rendered = _tail_clip(rendered, budget)
 
         return SectionRender(
             raw=raw,
@@ -403,6 +441,62 @@ class ContextManager:
             entries.append({"recent": False, "lines": self._render_history_item(item, 60)})
 
         return entries, details
+
+    def _aggregate_history_summary(self, history, recent_start):
+        """把最近窗口之前的旧历史确定性聚合成一段紧凑摘要（Level 2）。
+
+        不调用模型，纯规则聚合：把旧历史从「逐条压缩」进一步压成「清单式摘要」，
+        让长会话的旧历史体积从 O(n) 降到 O(1)。返回 (摘要文本, 统计 details)。
+        """
+        older = list(history[:recent_start])
+        read_files = []
+        run_commands = []
+        edited_files = []
+        other_tool_names = []
+        conclusions = []
+
+        for item in older:
+            if item.get("role") == "tool":
+                name = str(item.get("name", ""))
+                path = str(item.get("args", {}).get("path", "")).strip()
+                if name == "read_file" and path and path not in read_files:
+                    read_files.append(path)
+                elif name in ("write_file", "patch_file") and path and path not in edited_files:
+                    edited_files.append(path)
+                elif name == "run_shell":
+                    command = str(item.get("args", {}).get("command", "")).strip()
+                    if command and command not in run_commands:
+                        run_commands.append(command)
+                elif name and name not in other_tool_names:
+                    other_tool_names.append(name)
+            elif item.get("role") == "assistant":
+                content = str(item.get("content", "")).strip()
+                if content and len(content) <= 200 and content not in conclusions:
+                    conclusions.append(content)
+
+        lines = ["[Earlier transcript summary]"]
+        if read_files:
+            lines.append(f"- read files: {', '.join(read_files[:12])}")
+        if run_commands:
+            lines.append(f"- ran commands: {'; '.join(run_commands[:8])}")
+        if edited_files:
+            lines.append(f"- edited files: {', '.join(edited_files[:12])}")
+        if conclusions:
+            lines.append(f"- assistant conclusions: {'; '.join(conclusions[:4])}")
+        if other_tool_names:
+            lines.append(f"- other tools: {', '.join(other_tool_names[:8])}")
+        lines.append(f"- ({len(older)} earlier messages summarized)")
+        summary_text = "\n".join(lines)
+
+        details = {
+            "older_summary_chars": len(summary_text),
+            "files_read_count": len(read_files),
+            "commands_run_count": len(run_commands),
+            "files_edited_count": len(edited_files),
+            "assistant_conclusions_count": len(conclusions),
+            "other_tool_kinds_count": len(other_tool_names),
+        }
+        return summary_text, details
 
     def _reusable_file_summary(self, path):
         memory = getattr(self.agent, "memory", None)
@@ -499,6 +593,12 @@ class ContextManager:
                 "collapsed_duplicate_reads": int(rendered["history"].details.get("collapsed_duplicate_reads", 0)),
                 "reused_file_summary_count": int(rendered["history"].details.get("reused_file_summary_count", 0)),
                 "summarized_tool_count": int(rendered["history"].details.get("summarized_tool_count", 0)),
+                "aggregated_older_summary": bool(rendered["history"].details.get("aggregated_older_summary", False)),
+                "older_summary_chars": int(rendered["history"].details.get("older_summary_chars", 0)),
+                "files_read_count": int(rendered["history"].details.get("files_read_count", 0)),
+                "commands_run_count": int(rendered["history"].details.get("commands_run_count", 0)),
+                "files_edited_count": int(rendered["history"].details.get("files_edited_count", 0)),
+                "assistant_conclusions_count": int(rendered["history"].details.get("assistant_conclusions_count", 0)),
             },
             "current_request": {
                 "text": user_message,
